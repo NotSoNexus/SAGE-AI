@@ -47,7 +47,7 @@ def cambio(antes, despues, umbral=UMBRAL_CAMBIO):
     return diferencia(antes, despues) > umbral
 
 
-def esperar_estable(timeout=20.0, intervalo=0.5, estables=3, minimo=1.0,
+def esperar_estable(timeout=20.0, intervalo=0.3, estables=3, minimo=0.8,
                     requerir_cambio=False, espera_sin_cambio=4.0, umbral=UMBRAL_ESTABLE):
     """Bloquea hasta que la pantalla deja de cambiar (p. ej. una página terminó de cargar).
 

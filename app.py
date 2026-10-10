@@ -5,16 +5,18 @@ import math
 import time
 import random
 import subprocess
+
+import numpy as np
 from functools import lru_cache
 from urllib.parse import urlparse
 
 from PySide6.QtCore import (
-    Qt, QTimer, QThread, Signal, QPointF, QRectF, QLineF, QSize,
+    Qt, QObject, QTimer, QThread, Signal, QPointF, QRectF, QLineF, QSize,
     QVariantAnimation, QEasingCurve, QPropertyAnimation,
 )
 from PySide6.QtGui import (
     QPainter, QPixmap, QColor, QRadialGradient, QLinearGradient, QBrush, QPen,
-    QFont, QPolygonF, QPainterPath, QKeySequence, QShortcut, QCursor,
+    QFont, QPolygonF, QPainterPath, QKeySequence, QShortcut, QCursor, QIcon, QImage,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout,
@@ -23,12 +25,14 @@ from PySide6.QtWidgets import (
 )
 
 from cerebro import Cerebro
-from oido import Grabadora, GrabadoraPC, transcribir, precargar
-from boca import hablar
+from oido import Grabadora, GrabadoraPC, EscuchaContinua, fue_llamada, transcribir, precargar
+from boca import hablar, esta_hablando, aviso
 import ojos
+from web_conocimiento import mapa_visual
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
 RUTA_AVATAR = os.path.join(AQUI, "avatar.png")
+RUTA_ICONO = os.path.join(AQUI, "sage.ico")
 
 COLORES = {
     "idle": QColor(57, 255, 20),
@@ -56,9 +60,10 @@ FPS_MS = 33
 
 # ---------- Comandos tácticos embebidos en la respuesta ----------
 RE_ACCION = re.compile(
-    r'\[(?P<tipo>ABRIR|ENFOCAR|CERRAR|TECLA|PULSAR|BUSCAR):\s*(?P<arg>.*?)\]'
+    r'\[(?P<tipo>ABRIR|ENFOCAR|CERRAR|TECLA|PULSAR_DER|PULSAR|BUSCAR|ATAJO|ARRASTRAR|DESCARGAR|DIBUJAR|TRAZO|JUGAR):\s*(?P<arg>.*?)\]'
     r'|(?s:\[(?P<tipo_e>ESCRIBIR):\s*(?P<arg_e>.*?)\])'
     r'|\[(?P<tipo_c>CLICK):\s*(?P<x>\d+)\s*,\s*(?P<y>\d+)\]'
+    r'|\[(?P<tipo_d>CLICK_DER)(?::\s*(?P<xd>\d+)\s*,\s*(?P<yd>\d+))?\]'
     r'|\[(?P<tipo_s>SCROLL):\s*(?P<cant>-?\d+)\]'
     r'|\[(?P<tipo_w>ESPERAR)(?::\s*(?P<seg>\d+(?:\.\d+)?))?\]'
     r'|\[(?P<tipo_x>CIRCULOS)\]',
@@ -66,15 +71,16 @@ RE_ACCION = re.compile(
 )
 RE_APAGAR = re.compile(r'\[APAGAR\]', re.I)
 RE_LIMPIAR = re.compile(
-    r'\[(?:ABRIR|ENFOCAR|CERRAR|TECLA|PULSAR|BUSCAR):\s*.*?\]'
+    r'\[(?:ABRIR|ENFOCAR|CERRAR|TECLA|PULSAR_DER|PULSAR|BUSCAR|ATAJO|ARRASTRAR|DESCARGAR|DIBUJAR|TRAZO|JUGAR):\s*.*?\]'
     r'|(?s:\[ESCRIBIR:\s*.*?\])'
     r'|\[CLICK:\s*\d+\s*,\s*\d+\]'
+    r'|\[CLICK_DER(?::\s*\d+\s*,\s*\d+)?\]'
     r'|\[SCROLL:\s*-?\d+\]'
     r'|\[ESPERAR(?::\s*\d+(?:\.\d+)?)?\]'
     r'|\[CIRCULOS\]|\[APAGAR\]',
     re.I,
 )
-RE_PARCIAL = re.compile(r'\[(?:ABRIR|ENFOCAR|CERRAR|TECLA|ESCRIBIR|PULSAR|BUSCAR|CLICK|SCROLL|ESPERAR|CIRCULOS|APAGAR)[^\]]*$', re.I)
+RE_PARCIAL = re.compile(r'\[(?:ABRIR|ENFOCAR|CERRAR|TECLA|ESCRIBIR|PULSAR|BUSCAR|ATAJO|ARRASTRAR|DESCARGAR|DIBUJAR|TRAZO|JUGAR|CLICK|SCROLL|ESPERAR|CIRCULOS|APAGAR)[^\]]*$', re.I)
 
 
 def extraer_acciones(texto):
@@ -84,6 +90,7 @@ def extraer_acciones(texto):
         if m.group("tipo"): acciones.append((m.group("tipo").lower(), m.group("arg").strip()))
         elif m.group("tipo_e"): acciones.append(("escribir", m.group("arg_e")))
         elif m.group("tipo_c"): acciones.append(("click", (m.group("x"), m.group("y"))))
+        elif m.group("tipo_d"): acciones.append(("click_der", (m.group("xd"), m.group("yd"))))
         elif m.group("tipo_s"): acciones.append(("scroll", m.group("cant")))
         elif m.group("tipo_w"): acciones.append(("esperar", m.group("seg") or ""))
         elif m.group("tipo_x"): acciones.append(("circulos", ""))
@@ -257,11 +264,66 @@ def traer_al_frente(nombre):
     return False
 
 
+# Juegos que se abren por su URI de Steam (más fiable que buscar el .exe). Añade los tuyos aquí.
+JUEGOS_LANZADOR = {
+    "geometry dash": "steam://rungameid/322170",
+    "geometrydash": "steam://rungameid/322170",
+}
+
+DURACION_MOUSE = float(os.getenv("SAGE_MOUSE_DURACION", "0.18"))  # segundos por desplazamiento del cursor
+UMBRAL_CLICK_DER = 0.004  # un menú contextual es pequeño: se confirma con un cambio de pantalla menor que el de un click normal
+
+
+def escribir_unicode(texto, intervalo=0.006):
+    """Escribe cualquier texto (tildes, ñ, ¿¡, emojis) con SendInput Unicode. pyautogui.write NO sabe escribir
+    caracteres fuera de ASCII. Solo Windows. '\n' se envía como Enter y '\t' como Tab."""
+    import ctypes
+    from ctypes import wintypes
+
+    if sys.platform != "win32":
+        raise RuntimeError("escribir_unicode solo funciona en Windows")
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _U(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+    def enviar(vk, scan, flags):
+        entrada = INPUT()
+        entrada.type = 1  # INPUT_KEYBOARD
+        entrada.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(entrada), ctypes.sizeof(INPUT))
+
+    for ch in texto:
+        if ch in ("\n", "\t"):
+            vk = 0x0D if ch == "\n" else 0x09
+            enviar(vk, 0, 0)
+            enviar(vk, 0, 2)
+        else:
+            datos = ch.encode("utf-16-le")
+            for i in range(0, len(datos), 2):
+                unidad = int.from_bytes(datos[i:i + 2], "little")
+                enviar(0, unidad, 0x0004)          # KEYEVENTF_UNICODE
+                enviar(0, unidad, 0x0004 | 0x0002)  # + KEYEVENTF_KEYUP
+        time.sleep(intervalo)
+
+
 class Ejecutor(QThread):
     """Ejecuta los comandos tácticos EN ORDEN mirando la pantalla en tiempo real:
     espera a que las páginas terminen de cargar, localiza los elementos con visión,
     verifica que cada click surtió efecto, reintenta y aprende de sus errores."""
     log = Signal(str)
+    vista = Signal(bytes, int, int, str)  # fotograma + texto para la ventanita «SAGE ve en vivo» (w=0 la cierra)
     hud = Signal(bool)  # False = ocultar la HUD (para que no tape ni ensucie la captura), True = mostrarla
 
     MAX_INTENTOS = 4
@@ -279,6 +341,9 @@ class Ejecutor(QThread):
         self._vio_pantalla = False
         self._obstaculos = 0
         self._esperas_ult = 0
+        self._ya_espero = False   # ya se esperó a que la página cargara (evita una espera extra al buscar)
+        self._ultimo_entorno = ""
+        self._ult_vista = 0.0
 
     # ---------- flujo principal ----------
     def run(self):
@@ -291,14 +356,18 @@ class Ejecutor(QThread):
         except Exception as e:
             self.log.emit(f"⚠ Fallo inesperado del ejecutor: {e}")
         finally:
+            self.vista.emit(b"", 0, 0, "")
             if ocultar:
                 self.hud.emit(True)
 
     def _ejecutar(self):
         log = self.log.emit
-        if any(t in ("escribir", "tecla", "click", "pulsar", "scroll", "circulos") for t, _ in self.acciones):
+        if any(t in ("escribir", "tecla", "atajo", "buscar", "click", "click_der", "pulsar", "pulsar_der", "scroll", "circulos",
+                                              "arrastrar", "descargar", "dibujar", "trazo", "jugar")
+               for t, _ in self.acciones):
             try:
                 import pyautogui
+                pyautogui.PAUSE = 0.02  # por defecto pyautogui espera 0.1 s tras CADA acción
                 self._pag = pyautogui
             except Exception as e:
                 log(f"⚠ pyautogui no disponible: {e}")
@@ -312,8 +381,37 @@ class Ejecutor(QThread):
 
         if self._vio_pantalla and self.cerebro is not None:
             self._verificacion_final()
+        self._aprender_de_fallos()
         if self.cerebro is not None and self._notas:
             self.cerebro.registrar_resultado(" | ".join(self._notas))
+
+    _RE_FALLO = re.compile(r"SIN efecto|NO logré|no encontré|falló|no pude|no hay control|sin plantilla|mal formado", re.I)
+
+    def _aprender_de_fallos(self):
+        """Si algo salió mal, destila una lección y la guarda para no repetir el error."""
+        if self.cerebro is None: return
+        fallos = [n for n in self._notas if self._RE_FALLO.search(n)]
+        if not fallos: return
+        try:
+            self.log.emit("🧠 Analizando por qué falló...")
+            if self.cerebro.analizar_fallo(self.objetivo, [f"{t}: {a}" for t, a in self.acciones], self._notas, ojos.capturar()):
+                self.log.emit("🧠 Error analizado. Lección guardada en mi memoria.")
+        except Exception as e:
+            print(f"[Lecciones] {e}")
+
+    def _ver(self, img, texto="", ancho=384, min_dt=0.1):
+        """Manda a la ventanita «SAGE ve en vivo» lo que SAGE está mirando (por defecto máx. ~10 fps; el piloto de GD la regula él)."""
+        ahora = time.perf_counter()
+        if img is None or ahora - self._ult_vista < min_dt: return
+        self._ult_vista = ahora
+        try:
+            if isinstance(img, np.ndarray):
+                a = np.ascontiguousarray(img[:, :, :3])
+            else:
+                a = np.asarray(img.convert("RGB").resize((ancho, max(1, int(img.height * ancho / img.width)))))
+            self.vista.emit(a.tobytes(), a.shape[1], a.shape[0], str(texto)[:140])
+        except Exception:
+            pass
 
     # ---------- utilidades de visión ----------
     def _requiere_pag(self):
@@ -326,6 +424,7 @@ class Ejecutor(QThread):
         """Si se abrió/enfocó algo, mira la pantalla hasta que deje de cambiar (página cargada)."""
         modo, self._espera = self._espera, None
         if not modo: return
+        self._ya_espero = True
         self.log.emit("👁 Observando la pantalla hasta que termine de cargar...")
         ok, seg = ojos.esperar_estable(
             timeout=25.0 if modo == "abrir" else 8.0,
@@ -337,11 +436,11 @@ class Ejecutor(QThread):
         else:
             self.log.emit(f"⏳ La pantalla seguía cambiando tras {seg:.0f}s; continúo igualmente.")
 
-    def _confirmar(self, antes):
+    def _confirmar(self, antes, umbral=None):
         """Tras un click: espera a que se asiente y comprueba que la pantalla realmente reaccionó."""
-        time.sleep(0.9)
-        ojos.esperar_estable(timeout=6.0, minimo=0.5, estables=2)
-        return ojos.cambio(antes, ojos.capturar())
+        time.sleep(0.5)
+        ojos.esperar_estable(timeout=5.0, minimo=0.3, estables=2)
+        return ojos.cambio(antes, ojos.capturar(), umbral or ojos.UMBRAL_CAMBIO)
 
     def _aprender(self):
         if self.cerebro is None: return
@@ -366,10 +465,24 @@ class Ejecutor(QThread):
 
     # ---------- acciones ----------
     def _a_abrir(self, cmd):
-        cmd = cmd.strip()
+        cmd = JUEGOS_LANZADOR.get(cmd.strip().lower(), cmd.strip())
         self.log.emit(f"⚡ Ejecutando anulación de sistema: {cmd}")
-        os.startfile(cmd)
+        try:
+            os.startfile(cmd)
+        except OSError:
+            # No es una ruta/URL/comando conocido: lo busca en el menú Inicio como haría una persona
+            try:
+                import pyautogui
+                self.log.emit(f"🔎 Buscando «{cmd}» en el menú Inicio...")
+                pyautogui.press("win"); time.sleep(0.7)
+                pyautogui.write(cmd, interval=0.03); time.sleep(1.3)
+                pyautogui.press("enter")
+            except Exception as e:
+                self.log.emit(f"⚠ No pude abrir «{cmd}»: {e}")
+                self._notas.append(f"NO logré abrir {cmd} ({e})")
+                return
         self._espera = "abrir"
+        self._ya_espero = False
         if cmd.lower().startswith(("http://", "https://")):
             self._dominio = urlparse(cmd).netloc.replace("www.", "")
         self._notas.append(f"abrí {cmd}")
@@ -380,8 +493,10 @@ class Ejecutor(QThread):
         if "spotify" in n:
             os.startfile("spotify:")
         elif "discord" in n:
-            ruta = os.path.join(os.getenv('LOCALAPPDATA'), 'Discord', 'Update.exe')
-            subprocess.Popen([ruta, '--processStart', 'Discord.exe'])
+            if not traer_al_frente("Discord"):
+                ruta = os.path.join(os.getenv('LOCALAPPDATA'), 'Discord', 'Update.exe')
+                subprocess.Popen([ruta, '--processStart', 'Discord.exe'])
+                time.sleep(2.0)
         elif not traer_al_frente(app_name):
             self.log.emit(f"⚠ No se encontró ventana visible para: {app_name}")
             self._notas.append(f"no encontré ventana de {app_name}")
@@ -395,7 +510,11 @@ class Ejecutor(QThread):
         if not pag: return
         self._esperar_pantalla()
         self.log.emit("⌨️ Inyectando pulsaciones de teclado...")
-        pag.write(txt, interval=0.015)
+        try:
+            escribir_unicode(txt)
+        except Exception as e:
+            self.log.emit(f"⚠ Escritura Unicode no disponible ({e}); uso el método básico.")
+            pag.write(txt, interval=0.015)
         self._notas.append("escribí texto")
 
     def _a_tecla(self, tecla):
@@ -405,6 +524,22 @@ class Ejecutor(QThread):
         self.log.emit(f"⌨️ Ejecutando comando de tecla: [{tecla.upper()}]")
         pag.press(tecla.lower().strip())
         self._notas.append(f"pulsé tecla {tecla}")
+
+    def _a_atajo(self, combo):
+        pag = self._requiere_pag()
+        if not pag: return
+        self._esperar_pantalla()
+        alias = {"control": "ctrl", "escape": "esc", "arriba": "up", "abajo": "down", "izquierda": "left",
+                 "derecha": "right", "intro": "enter", "return": "enter", "mayus": "shift", "windows": "win"}
+        partes = [p.strip().lower() for p in re.split(r"[+\s]+", combo) if p.strip()]
+        teclas = [alias.get(p, p) for p in partes]
+        if not teclas:
+            self.log.emit("⚠ Atajo vacío.")
+            return
+        self.log.emit(f"⌨️ Ejecutando atajo: [{'+'.join(teclas).upper()}]")
+        pag.hotkey(*teclas)
+        time.sleep(0.3)
+        self._notas.append(f"atajo {'+'.join(teclas)}")
 
     def _a_esperar(self, seg):
         if seg:
@@ -424,7 +559,7 @@ class Ejecutor(QThread):
         for intento in (1, 2):
             antes = ojos.capturar()
             self.log.emit(f"🖱️ Desplazando cursor y ejecutando click en ({x}, {y})...")
-            pag.moveTo(x, y, duration=0.6, tween=pag.easeInOutQuad)
+            pag.moveTo(x, y, duration=DURACION_MOUSE, tween=pag.easeOutQuad)
             pag.click()
             if self._confirmar(antes):
                 self.log.emit("✅ Click confirmado: la pantalla reaccionó.")
@@ -442,17 +577,17 @@ class Ejecutor(QThread):
         reacciona, recurre al teclado (RePág/AvPág). Devuelve la captura posterior. dir_: -1 abajo, 1 arriba."""
         pag = self._pag
         sw, sh = pag.size()
-        pag.moveTo(sw // 2, sh // 2, duration=0.2)
-        time.sleep(0.15)
+        pag.moveTo(sw // 2, sh // 2, duration=0.08)
+        time.sleep(0.05)
         for _ in range(max(1, muescas)):
             pag.scroll(dir_ * 120)
             time.sleep(0.04)
-        ojos.esperar_estable(timeout=6.0, minimo=0.6, estables=2)
+        ojos.esperar_estable(timeout=6.0, minimo=0.3, estables=2)
         img = ojos.capturar()
         if img is not None and not ojos.cambio(antes, img, umbral=0.004):
             self.log.emit("⌨️ La rueda no movió la página; pruebo con el teclado...")
             pag.press("pagedown" if dir_ < 0 else "pageup")
-            ojos.esperar_estable(timeout=6.0, minimo=0.6, estables=2)
+            ojos.esperar_estable(timeout=6.0, minimo=0.3, estables=2)
             img = ojos.capturar()
         return img
 
@@ -464,8 +599,9 @@ class Ejecutor(QThread):
         sw, sh = pag.size()
         self._esperar_pantalla()
         self._esperas_ult = 0
+        ctx = mapa_visual(f"{self._dominio} {desc} {self.objetivo}")
         img = ojos.capturar()
-        dir_, invertido, vista, espera_inicial, fallos = direccion, False, False, True, 0
+        dir_, invertido, vista, espera_inicial, fallos = direccion, False, False, not self._ya_espero, 0
 
         for _ in range(self.MAX_PASOS):
             if img is None:
@@ -474,7 +610,7 @@ class Ejecutor(QThread):
 
             if not vista:
                 log(f"👁 Buscando «{desc}» en pantalla...")
-                r = self.cerebro.localizar_elemento(img, desc)
+                r = self.cerebro.localizar_elemento(img, desc, ctx)
                 if r is None:
                     fallos += 1
                     if fallos >= 3:
@@ -484,13 +620,16 @@ class Ejecutor(QThread):
                     img = ojos.capturar()
                     continue
 
+                if r.get("entorno") and r["entorno"] != self._ultimo_entorno:
+                    self._ultimo_entorno = r["entorno"]
+                    log(f"🧭 Entorno detectado: {r['entorno']}")
                 if r["encontrado"] and (not r["cargando"] or self._esperas_ult >= 2):
                     return img, r
 
                 if not r["encontrado"] and r["obstaculo"] and self._obstaculos < 2:
                     self._obstaculos += 1
                     log(f"🚧 Obstáculo detectado: {r['obstaculo']}. Lo despejo.")
-                    pag.moveTo(int(r["ox"] * sw), int(r["oy"] * sh), duration=0.5, tween=pag.easeInOutQuad)
+                    pag.moveTo(int(r["ox"] * sw), int(r["oy"] * sh), duration=DURACION_MOUSE, tween=pag.easeOutQuad)
                     pag.click()
                     time.sleep(1.0)
                     img = ojos.capturar()
@@ -555,56 +694,107 @@ class Ejecutor(QThread):
             self._notas.append(f"NO encontré «{desc}» tras recorrer la página")
 
     def _a_pulsar(self, desc):
+        self._pulsar(desc, "left")
+
+    def _a_pulsar_der(self, desc):
+        """CLICK DERECHO sobre un elemento localizado con visión: abre su menú contextual y lo deja abierto."""
+        self._pulsar(desc, "right")
+
+    def _pulsar(self, desc, boton="left"):
         pag = self._requiere_pag()
         if not pag: return
         if self.cerebro is None:
             self.log.emit("⚠ Módulo de visión no disponible.")
             return
         desc = desc.strip()
+        der = boton == "right"
+        verbo = "click derecho" if der else "click"
+        umbral = UMBRAL_CLICK_DER if der else None
+        intentos = 2 if der else self.MAX_INTENTOS
         self._vio_pantalla = True
         sw, sh = pag.size()
 
-        for intento in range(1, self.MAX_INTENTOS + 1):
+        for intento in range(1, intentos + 1):
+            if der and intento > 1:
+                pag.press("esc")  # cierra un menú que no se llegó a detectar: así no se alterna abrir/cerrar
+                time.sleep(0.3)
             img, r = self._localizar_scrolleando(desc)
             if r is None:
                 break
             x, y = int(r["x"] * sw), int(r["y"] * sh)
-            self.log.emit(f"🖱️ Elemento localizado en ({x}, {y}). Ejecutando click...")
-            pag.moveTo(x, y, duration=0.6, tween=pag.easeInOutQuad)
-            pag.click()
-            if self._confirmar(img):
-                self.log.emit("✅ Click confirmado: la pantalla reaccionó.")
-                self._notas.append(f"pulsé «{desc}» en ({x}, {y}) con éxito (intento {intento})")
+            self.log.emit(f"🖱️ Elemento localizado en ({x}, {y}). Ejecutando {verbo}...")
+            pag.moveTo(x, y, duration=DURACION_MOUSE, tween=pag.easeOutQuad)
+            pag.click(button=boton)
+            if self._confirmar(img, umbral):
+                if der:
+                    self.log.emit("✅ Click derecho confirmado: se abrió el menú contextual.")
+                    self._notas.append(f"click derecho sobre «{desc}» en ({x}, {y}) con éxito (intento {intento}); el menú contextual quedó abierto")
+                else:
+                    self.log.emit("✅ Click confirmado: la pantalla reaccionó.")
+                    self._notas.append(f"pulsé «{desc}» en ({x}, {y}) con éxito (intento {intento})")
                 if intento > 1 or self._esperas_ult: self._aprender()
                 return
             self.log.emit("⚠ La pantalla no reaccionó. Reevalúo y reintento...")
 
-        self.log.emit(f"❌ No logré pulsar «{desc}».")
-        self._notas.append(f"NO logré pulsar «{desc}»")
+        self.log.emit(f"❌ No logré hacer {verbo} sobre «{desc}».")
+        self._notas.append(f"NO logré hacer {verbo} sobre «{desc}»")
+
+    def _a_click_der(self, coords):
+        """Click derecho en coordenadas exactas, o donde ya está el cursor si no se dieron."""
+        pag = self._requiere_pag()
+        if not pag: return
+        self._esperar_pantalla()
+        self._vio_pantalla = True
+        x, y = coords
+        antes = ojos.capturar()
+        if x is not None and y is not None:
+            x, y = int(x), int(y)
+            self.log.emit(f"🖱️ Click derecho en ({x}, {y})...")
+            pag.moveTo(x, y, duration=DURACION_MOUSE, tween=pag.easeOutQuad)
+            donde = f"({x}, {y})"
+        else:
+            self.log.emit("🖱️ Click derecho en la posición actual del cursor...")
+            donde = "la posición actual del cursor"
+        pag.click(button="right")
+        if self._confirmar(antes, UMBRAL_CLICK_DER):
+            self.log.emit("✅ Click derecho confirmado: la pantalla reaccionó.")
+            self._notas.append(f"click derecho en {donde} confirmado; el menú contextual quedó abierto")
+        else:
+            self.log.emit("⚠ La pantalla no reaccionó al click derecho.")
+            self._notas.append(f"click derecho en {donde} SIN efecto visible")
 
     def _a_scroll(self, cantidad):
         pag = self._requiere_pag()
         if not pag: return
         self._esperar_pantalla()
-        self.log.emit("🖱️ Haciendo scroll en pantalla...")
         cant = int(cantidad)
-        if cant != 0:
-            sw, sh = pag.size()
-            pag.moveTo(sw // 2, sh // 2, duration=0.2)
-            time.sleep(0.15)
-            antes = ojos.capturar()
-            direccion = 1 if cant > 0 else -1
-            for _ in range(max(1, round(abs(cant) / 120))):
-                pag.scroll(direccion * 120)
-                time.sleep(0.04)
-            time.sleep(0.6)
-            if antes is not None and not ojos.cambio(antes, ojos.capturar(), umbral=0.004):
-                self.log.emit("⌨️ La rueda no movió la página; pruebo con el teclado...")
-                for _ in range(max(1, round(abs(cant) / 600))):
-                    pag.press("pageup" if cant > 0 else "pagedown")
-                    time.sleep(0.2)
-        time.sleep(0.4)
-        self._notas.append(f"scroll {cantidad}")
+        if cant == 0:
+            return
+        self.log.emit(f"🖱️ Haciendo scroll hacia {'arriba' if cant > 0 else 'abajo'} ({abs(cant)})...")
+        sw, sh = pag.size()
+        pag.moveTo(sw // 2, sh // 2, duration=0.08)
+        time.sleep(0.05)
+        antes = ojos.capturar()
+        direccion = 1 if cant > 0 else -1
+        for _ in range(max(1, round(abs(cant) / 120))):
+            pag.scroll(direccion * 120)
+            time.sleep(0.04)
+        # Espera a que acabe el scroll suave y a que carguen las miniaturas/comentarios nuevos (YouTube)
+        ojos.esperar_estable(timeout=3.0, minimo=0.4, estables=2)
+        movio = antes is None or ojos.cambio(antes, ojos.capturar(), umbral=0.004)
+        if not movio:
+            self.log.emit("⌨️ La rueda no movió la página; pruebo con el teclado...")
+            for _ in range(max(1, round(abs(cant) / 600))):
+                pag.press("pageup" if cant > 0 else "pagedown")
+                time.sleep(0.2)
+            ojos.esperar_estable(timeout=3.0, minimo=0.4, estables=2)
+            movio = ojos.cambio(antes, ojos.capturar(), umbral=0.004)
+        if movio:
+            self._notas.append(f"scroll {cantidad} (la página se movió)")
+        else:
+            self.log.emit("⚠ La página no se movió.")
+            self._notas.append(f"scroll {cantidad} SIN efecto visible (¿pantalla completa, un Short o un menú abierto?)")
+        time.sleep(0.3)
 
     def _a_circulos(self, _arg=""):
         pag = self._requiere_pag()
@@ -618,6 +808,396 @@ class Ejecutor(QThread):
             pag.moveTo(cx + r * math.cos(ang), cy + r * math.sin(ang), duration=0.015)
         pag.moveTo(cx, cy, duration=0.2)
         self._notas.append("círculos con el mouse")
+
+    # ---------- movimiento humano: arrastrar, descargar imágenes y dibujar ----------
+    def _mover_humano(self, x0, y0, x1, y1, paso_s=0.008):
+        """Mueve el cursor con curva de Bézier, velocidad variable y micro-temblor (el botón queda como esté)."""
+        pag = self._pag
+        dist = math.hypot(x1 - x0, y1 - y0)
+        n = max(12, min(80, int(dist / 12)))
+        nx, ny = -(y1 - y0) / (dist or 1), (x1 - x0) / (dist or 1)
+        arco = random.uniform(-0.12, 0.12) * dist
+        cx, cy = (x0 + x1) / 2 + nx * arco, (y0 + y1) / 2 + ny * arco
+        for i in range(1, n + 1):
+            t = i / n
+            t = t * t * (3 - 2 * t)
+            x = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+            y = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+            if i < n:
+                x += random.uniform(-1.2, 1.2); y += random.uniform(-1.2, 1.2)
+            pag.moveTo(x, y, _pause=False)
+            time.sleep(paso_s * random.uniform(0.7, 1.4))
+
+    def _arrastrar_xy(self, x0, y0, x1, y1):
+        pag = self._pag
+        px, py = pag.position()
+        self._mover_humano(px, py, x0, y0)
+        time.sleep(random.uniform(0.15, 0.3))
+        pag.mouseDown(_pause=False)
+        try:
+            time.sleep(random.uniform(0.15, 0.3))
+            self._mover_humano(x0, y0, x1, y1, paso_s=0.012)
+            time.sleep(random.uniform(0.2, 0.4))
+        finally:
+            pag.mouseUp(_pause=False)
+
+    def _a_arrastrar(self, arg):
+        """[ARRASTRAR: origen -> destino]: localiza ambos con visión, mantiene el click y mueve el mouse como una persona."""
+        pag = self._requiere_pag()
+        if not pag: return
+        if self.cerebro is None:
+            self.log.emit("⚠ Módulo de visión no disponible."); return
+        m = re.split(r"\s*(?:->|→|=>)\s*", arg, maxsplit=1)
+        if len(m) != 2 or not m[0].strip() or not m[1].strip():
+            self.log.emit("⚠ ARRASTRAR necesita «origen -> destino»."); self._notas.append("ARRASTRAR mal formado"); return
+        origen, destino = m[0].strip(), m[1].strip()
+        self._vio_pantalla = True
+        sw, sh = pag.size()
+        _, r0 = self._localizar_scrolleando(origen, scroll=False)
+        if r0 is None:
+            self._notas.append(f"ARRASTRAR: no encontré el origen «{origen}»"); return
+        _, r1 = self._localizar_scrolleando(destino, scroll=False)
+        if r1 is None:
+            self._notas.append(f"ARRASTRAR: no encontré el destino «{destino}»"); return
+        x0, y0, x1, y1 = int(r0["x"] * sw), int(r0["y"] * sh), int(r1["x"] * sw), int(r1["y"] * sh)
+        antes = ojos.capturar()
+        self.log.emit(f"🖱️ Arrastrando «{origen}» ({x0}, {y0}) → «{destino}» ({x1}, {y1})...")
+        self._arrastrar_xy(x0, y0, x1, y1)
+        if self._confirmar(antes):
+            self.log.emit("✅ Arrastre confirmado: la pantalla reaccionó.")
+            self._notas.append(f"arrastré «{origen}» a «{destino}» (la pantalla cambió)")
+        else:
+            self.log.emit("⚠ La pantalla no reaccionó al arrastre.")
+            self._notas.append(f"arrastre «{origen}» -> «{destino}» SIN efecto visible")
+
+    def _a_descargar(self, desc):
+        """[DESCARGAR: imagen]: click derecho > Guardar imagen como... > Enter (carpeta propuesta)."""
+        pag = self._requiere_pag()
+        if not pag: return
+        if self.cerebro is None:
+            self.log.emit("⚠ Módulo de visión no disponible."); return
+        desc = desc.strip()
+        n0 = len(self._notas)
+        self._pulsar(desc, "right")
+        if not any("menú contextual quedó abierto" in n for n in self._notas[n0:]):
+            self._notas.append(f"DESCARGAR: no pude abrir el menú de «{desc}»"); return
+        time.sleep(0.6)
+        self._pulsar("opción Guardar imagen como (Save image as) del menú contextual", "left")
+        self.log.emit("👁 Esperando el diálogo de guardado...")
+        ojos.esperar_estable(timeout=6.0, minimo=0.8, requerir_cambio=True, espera_sin_cambio=2.0)
+        antes = ojos.capturar()
+        pag.press("enter")
+        time.sleep(0.8)
+        if ojos.cambio(antes, ojos.capturar(), 0.004):
+            self.log.emit("✅ Imagen guardada (el diálogo se cerró).")
+            self._notas.append(f"descargué la imagen «{desc}» con Guardar imagen como (diálogo aceptado)")
+        else:
+            self.log.emit("⚠ No vi que el diálogo se cerrara.")
+            self._notas.append(f"DESCARGAR «{desc}»: no pude confirmar que se guardara")
+
+    # ---------- dibujo ----------
+    def _trazo(self, puntos, paso_s=0.006):
+        """Dibuja una polilínea (píxeles) con el botón presionado."""
+        pag = self._pag
+        sw, sh = pag.size()
+        puntos = [(min(max(int(x), 2), sw - 3), min(max(int(y), 2), sh - 3)) for x, y in puntos]
+        if len(puntos) < 2: return
+        px, py = pag.position()
+        self._mover_humano(px, py, *puntos[0])
+        pag.mouseDown(_pause=False)
+        try:
+            time.sleep(0.05)
+            for (xa, ya), (xb, yb) in zip(puntos, puntos[1:]):
+                n = max(2, int(math.hypot(xb - xa, yb - ya) / 6))
+                for i in range(1, n + 1):
+                    t = i / n
+                    pag.moveTo(xa + (xb - xa) * t + random.uniform(-.5, .5), ya + (yb - ya) * t + random.uniform(-.5, .5), _pause=False)
+                    time.sleep(paso_s)
+        finally:
+            pag.mouseUp(_pause=False)
+        time.sleep(0.08)
+
+    @staticmethod
+    def _figura(nombre, cx, cy, r):
+        """Lista de trazos (listas de puntos) para una figura sencilla centrada en (cx, cy); None si no hay plantilla."""
+        def arco(a0, a1, rr=None, k=40, ox=0, oy=0):
+            rr = r if rr is None else rr
+            return [(cx + ox + rr * math.cos(a0 + (a1 - a0) * i / k), cy + oy + rr * math.sin(a0 + (a1 - a0) * i / k)) for i in range(k + 1)]
+        def c(a, rr=None):
+            rr = r if rr is None else rr
+            return (cx + rr * math.cos(a), cy + rr * math.sin(a))
+        n = nombre.lower()
+        full = 2 * math.pi
+        if any(k in n for k in ("circulo", "círculo", "redondo")): return [arco(0, full, k=60)]
+        if any(k in n for k in ("cuadrado", "caja")): return [[(cx - r, cy - r), (cx + r, cy - r), (cx + r, cy + r), (cx - r, cy + r), (cx - r, cy - r)]]
+        if "rectangulo" in n or "rectángulo" in n: return [[(cx - r * 1.5, cy - r), (cx + r * 1.5, cy - r), (cx + r * 1.5, cy + r), (cx - r * 1.5, cy + r), (cx - r * 1.5, cy - r)]]
+        if "triangulo" in n or "triángulo" in n: return [[(cx, cy - r), (cx + r, cy + r * .8), (cx - r, cy + r * .8), (cx, cy - r)]]
+        if "estrella" in n: return [[c(-math.pi / 2 + i * 4 * math.pi / 5) for i in range(6)]]
+        if "corazon" in n or "corazón" in n:
+            return [[(cx + r * math.sin(t) ** 3, cy - r * (13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)) / 16)
+                     for t in [i * full / 70 for i in range(71)]]]
+        if "espiral" in n: return [[(cx + r * (a / 12) * math.cos(a), cy + r * (a / 12) * math.sin(a)) for a in [i * 0.2 for i in range(61)]]]
+        if "flecha" in n: return [[(cx - r, cy), (cx + r, cy)], [(cx + r * .5, cy - r * .5), (cx + r, cy), (cx + r * .5, cy + r * .5)]]
+        if "cruz" in n: return [[(cx - r, cy), (cx + r, cy)], [(cx, cy - r), (cx, cy + r)]]
+        if "linea" in n or "línea" in n: return [[(cx - r, cy), (cx + r, cy)]]
+        if "onda" in n: return [[(cx - r * 1.5 + i * r * 3 / 60, cy + r * .4 * math.sin(i * math.pi / 7.5)) for i in range(61)]]
+        if "carita" in n or "cara" in n:
+            return [arco(0, full, k=60), arco(0, full, r * .1, 14, -r * .35, -r * .3), arco(0, full, r * .1, 14, r * .35, -r * .3), arco(.2 * math.pi, .8 * math.pi, r * .55, 20)]
+        if "sol" in n:
+            t = [arco(0, full, r * .5, 40)]
+            for i in range(8):
+                a = i * math.pi / 4
+                t.append([c(a, r * .7), c(a, r * 1.1)])
+            return t
+        if "casa" in n:
+            return [[(cx - r, cy + r), (cx - r, cy), (cx + r, cy), (cx + r, cy + r), (cx - r, cy + r)],
+                    [(cx - r * 1.2, cy), (cx, cy - r * .9), (cx + r * 1.2, cy)],
+                    [(cx - r * .2, cy + r), (cx - r * .2, cy + r * .45), (cx + r * .25, cy + r * .45), (cx + r * .25, cy + r)]]
+        if "flor" in n:
+            t = [arco(0, full, r * .2, 20, 0, -r * .3)]
+            for i in range(6):
+                a = i * math.pi / 3
+                t.append(arco(0, full, r * .28, 20, r * .5 * math.cos(a), -r * .3 + r * .5 * math.sin(a)))
+            t.append([(cx, cy + r * .25), (cx, cy + r)])
+            return t
+        if "arbol" in n or "árbol" in n:
+            return [[(cx - r * .12, cy + r), (cx - r * .12, cy + r * .2), (cx + r * .12, cy + r * .2), (cx + r * .12, cy + r)],
+                    arco(0, full, r * .7, 50, 0, -r * .3)]
+        if "gato" in n:
+            return [arco(0, full, r * .8, 50),
+                    [(cx - r * .7, cy - r * .35), (cx - r * .75, cy - r * 1.05), (cx - r * .2, cy - r * .72)],
+                    [(cx + r * .7, cy - r * .35), (cx + r * .75, cy - r * 1.05), (cx + r * .2, cy - r * .72)],
+                    arco(0, full, r * .07, 10, -r * .3, -r * .1), arco(0, full, r * .07, 10, r * .3, -r * .1),
+                    [(cx - r * .08, cy + r * .1), (cx + r * .08, cy + r * .1), (cx, cy + r * .2), (cx - r * .08, cy + r * .1)],
+                    [(cx - r * .9, cy + r * .1), (cx - r * .3, cy + r * .2)], [(cx + r * .9, cy + r * .1), (cx + r * .3, cy + r * .2)]]
+        return None
+
+    def _a_dibujar(self, arg):
+        """[DIBUJAR: figura] o [DIBUJAR: figura @ x,y ~ tamaño]: dibuja con el mouse sobre un lienzo ya abierto."""
+        pag = self._requiere_pag()
+        if not pag: return
+        self._esperar_pantalla()
+        sw, sh = pag.size()
+        m = re.match(r"^(?P<f>[^@~]+?)\s*(?:@\s*(?P<x>\d+)\s*,\s*(?P<y>\d+))?\s*(?:~\s*(?P<r>\d+))?\s*$", arg.strip())
+        if not m:
+            self.log.emit("⚠ DIBUJAR mal formado."); self._notas.append("DIBUJAR mal formado"); return
+        nombre = m.group("f").strip()
+        cx = int(m.group("x")) if m.group("x") else sw // 2
+        cy = int(m.group("y")) if m.group("y") else int(sh * 0.55)
+        r = int(m.group("r")) if m.group("r") else 150
+        trazos = self._figura(nombre, cx, cy, r)
+        if not trazos:
+            self.log.emit(f"⚠ No tengo plantilla para «{nombre}».")
+            self._notas.append(f"DIBUJAR «{nombre}»: sin plantilla (usa [TRAZO: x,y x,y ...] para dibujarlo a mano)"); return
+        self._vio_pantalla = True
+        antes = ojos.capturar()
+        self.log.emit(f"✏️ Dibujando «{nombre}» en ({cx}, {cy})...")
+        for t in trazos:
+            self._trazo(t)
+            time.sleep(0.1)
+        if self._confirmar(antes, 0.002):
+            self.log.emit("✅ Dibujo hecho: el lienzo cambió.")
+            self._notas.append(f"dibujé «{nombre}» en ({cx}, {cy}) tamaño {r}; el lienzo cambió")
+        else:
+            self.log.emit("⚠ El lienzo no cambió; ¿hay un pincel activo?")
+            self._notas.append(f"dibujo «{nombre}» SIN efecto visible (¿no hay lienzo o pincel activo?)")
+
+    def _a_trazo(self, arg):
+        """[TRAZO: x,y x,y ...]: línea continua por esos puntos (píxeles) con el click presionado."""
+        pag = self._requiere_pag()
+        if not pag: return
+        self._esperar_pantalla()
+        pts = [(int(a), int(b)) for a, b in re.findall(r"(-?\d+)\s*,\s*(-?\d+)", arg)]
+        if len(pts) < 2:
+            self.log.emit("⚠ TRAZO necesita al menos 2 puntos."); self._notas.append("TRAZO sin puntos suficientes"); return
+        self._vio_pantalla = True
+        self.log.emit(f"✏️ Trazando línea de {len(pts)} puntos...")
+        self._trazo(pts)
+        self._notas.append(f"trazo de {len(pts)} puntos dibujado")
+
+    # ---------- juegos ----------
+    def _a_jugar(self, arg):
+        """[JUGAR: juego u objetivo]: Geometry Dash tiene piloto de reflejos propio; el resto usa el bucle de visión."""
+        from gd_conocimiento import es_gd
+        pag = self._requiere_pag()
+        if not pag: return
+        if self.cerebro is None:
+            self.log.emit("⚠ Módulo de visión no disponible."); return
+        self._esperar_pantalla()
+        self._ver(ojos.capturar(), f"Mirando tu pantalla para jugar: {arg}")
+        if es_gd(arg): self._jugar_gd(arg)
+        else: self._a_jugar_generico(arg)
+
+    # ---------- Geometry Dash: menús con visión + reflejos locales + aprendizaje ----------
+    def _jugar_gd(self, juego):
+        from gd_jugador import GDJugador, FPS
+        from gd_conocimiento import nivel_en
+        pag, log = self._pag, self.log.emit
+        sw, sh = pag.size()
+        nivel = nivel_en(juego)
+        if sys.platform == "win32": traer_al_frente("Geometry Dash")
+        jug = GDJugador()
+        self._vio_pantalla = False
+
+        # Fase 1: navegar los menús con visión hasta que el nivel esté en marcha (el cubo visible)
+        previa, bitacora, hecho = ojos.capturar(), [], 0
+        objetivo_menu = ("Geometry Dash: SOLO navega los menús (Play, elegir el nivel "
+                         f"{'«' + nivel + '»' if nivel != 'generico' else 'que pidió Niko, por defecto Stereo Madness'}, Play del nivel) "
+                         "hasta que el nivel esté EMPEZANDO con el cubo visible. En cuanto el cubo esté dentro del nivel pon fin=true y resultado='nivel iniciado'. "
+                         "No pulses nada dentro del nivel.")
+        for n in range(1, 13):
+            if self._parar_pedido(): self._notas.append("GD: Niko me detuvo en los menús"); return
+            img = previa if previa is not None else ojos.capturar()
+            if img is not None and jug.hay_jugador(np.asarray(img.convert("RGB"))):
+                hecho += 1
+                if hecho >= 2: break
+            else:
+                hecho = 0
+            self._ver(img, f"[menú {n}] buscando cómo llegar al nivel...")
+            d = self.cerebro.decidir_jugada(img, objetivo_menu, bitacora[-6:], [])
+            if d is None: time.sleep(1.0); previa = ojos.capturar(); continue
+            log(f"🎮 [menú {n}] {d['razon']}")
+            if d["fin"] and "iniciado" in d["resultado"].lower():
+                time.sleep(1.5); break
+            hechas = [self._jugada(a, sw, sh) for a in d["acciones"]]
+            bitacora.append(f"{n}: {d['razon']} -> {', '.join(hechas)}")
+            time.sleep(1.0)
+            previa = ojos.capturar()
+
+        # Fase 2: reflejos rápidos con aprendizaje
+        log(f"⚡ Paso al piloto de reflejos (sin LLM, visión en vivo a {FPS} FPS).")
+        res = jug.jugar(nivel, log, self._parar_pedido, vista=lambda img, txt="": self._ver(img, txt, min_dt=0.0),
+                        felicidad=getattr(self.cerebro, "felicidad", None), hablar=hablar)
+        tiempos = res["tiempos"]
+        resumen = (f"{res['intentos']} intentos, mejor récord {res['mejor']:.1f}s (~{res['pct']:.0f}% del nivel)"
+                   + (f", último {tiempos[-1]:.1f}s" if tiempos else "") + f"; fin: {res['motivo']}")
+        log(f"🎮 Geometry Dash: {resumen}")
+        fel = getattr(self.cerebro, "felicidad", None)
+        if fel is not None:
+            log(f"💖 Felicidad {fel.resumen()} · +{res['ganada']:.1f} ganados en esta sesión de juego")
+            fel.guardar()
+        completado = False
+        if "no volvió a aparecer" in res["motivo"]:
+            time.sleep(0.8)
+            v = self.cerebro.verificar_resultado(ojos.capturar(), "¿La pantalla muestra el aviso de nivel completado (Level Complete)?")
+            if v:
+                completado = v["cumplido"]
+                log(f"{'🏆' if completado else '⚠'} {v['observacion']}")
+                if completado:
+                    if tiempos and tiempos[-1] > 10:
+                        GDJugador.registrar_completado(nivel, tiempos[-1])   # duración real del nivel: calibra el % de próximas partidas
+                    if fel is not None:
+                        gan = fel.recompensar(15, f"completar {nivel} en Geometry Dash")
+                        fel.guardar()
+                        log(f"🎉 ¡Nivel completado! +{gan:.0f} de felicidad → {fel.resumen()}")
+                        try: hablar("¡Lo logramos! ¡Nivel completado!")
+                        except Exception: pass
+        self._notas.append(f"jugué Geometry Dash ({nivel}): {resumen}" + ("; ¡NIVEL COMPLETADO!" if completado else "")
+                            + (f"; felicidad {fel.resumen()}" if fel is not None else ""))
+        try:
+            hist = [f"intento {i + 1}: {t:.1f}s" for i, t in enumerate(tiempos)] or ["sin intentos medidos"]
+            if self.cerebro.reflexionar_juego(f"Geometry Dash {nivel}", hist, resumen):
+                log("🧠 Lección de Geometry Dash guardada en mi memoria.")
+        except Exception as e:
+            print(f"[Lecciones] {e}")
+
+    _TECLAS_PROHIBIDAS = frozenset({"win", "winleft", "winright", "alt", "altleft", "altright", "ctrl", "ctrlleft", "ctrlright",
+                                    "sleep", "apps", "printscreen", "fn", "f4", "f8"})
+
+    @staticmethod
+    def _parar_pedido():
+        """F8 pulsada = Niko quiere que SAGE deje de jugar (solo Windows)."""
+        if sys.platform != "win32": return False
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x77) & 0x8000)
+        except Exception:
+            return False
+
+    def _jugada(self, a, sw, sh):
+        """Ejecuta una acción del juego; devuelve un resumen corto."""
+        pag = self._pag
+        t = str(a.get("t", "")).lower()
+        def pt(v):
+            return int(min(max(float(v[1]), 0), 1000) / 1000 * sw), int(min(max(float(v[0]), 0), 1000) / 1000 * sh)
+        try:
+            if t == "tecla":
+                k = str(a.get("v", "")).lower().strip()
+                if k in self._TECLAS_PROHIBIDAS or k not in pag.KEYBOARD_KEYS: return f"tecla «{k}» no permitida"
+                mant = min(max(float(a.get("mant", 0.05) or 0.05), 0.02), 3.0)
+                pag.keyDown(k, _pause=False)
+                time.sleep(mant)
+                pag.keyUp(k, _pause=False)
+                return f"tecla {k} {mant:.2f}s"
+            if t == "click":
+                x, y = pt(a["punto"])
+                pag.moveTo(x, y, duration=0.12, tween=pag.easeOutQuad)
+                pag.click()
+                return f"click ({x}, {y})"
+            if t == "arrastrar":
+                x0, y0 = pt(a["punto"]); x1, y1 = pt(a["punto2"])
+                self._arrastrar_xy(x0, y0, x1, y1)
+                return f"arrastre ({x0}, {y0})→({x1}, {y1})"
+            if t == "esperar":
+                s = min(max(float(a.get("s", 0.5) or 0.5), 0.05), 3.0)
+                time.sleep(s)
+                return f"espera {s:.1f}s"
+        except Exception as e:
+            return f"{t} falló ({e})"
+        return f"acción «{t}» desconocida"
+
+    def _a_jugar_generico(self, arg):
+        """Juego cualquiera: bucle mirar → decidir → actuar → comprobar, hasta que termine la partida."""
+        pag = self._requiere_pag()
+        if not pag: return
+        if self.cerebro is None:
+            self.log.emit("⚠ Módulo de visión no disponible."); return
+        juego = arg.strip() or "el juego que se ve en pantalla"
+        self._esperar_pantalla()
+        self._vio_pantalla = False   # la verificación final genérica no aplica a una partida
+        sw, sh = pag.size()
+        try: turnos = max(1, int(os.getenv("SAGE_JUEGO_TURNOS", "40")))
+        except ValueError: turnos = 40
+        lecciones = self.cerebro.lecciones_para(f"juego {juego}")
+        if lecciones: self.log.emit(f"🧠 Aplico {len(lecciones)} lección(es) de partidas anteriores.")
+        self.log.emit(f"🎮 A jugar: {juego} (F8 para parar).")
+        bitacora, resultado, fallos, quietos = [], "", 0, 0
+        previa = ojos.capturar()
+        for n in range(1, turnos + 1):
+            if self._parar_pedido():
+                resultado = "Niko me detuvo (F8)"; break
+            img = previa if previa is not None else ojos.capturar()
+            self._ver(img, f"[{n}] pensando la jugada...")
+            d = self.cerebro.decidir_jugada(img, juego, bitacora[-8:], lecciones)
+            if d is None:
+                fallos += 1
+                if fallos >= 3:
+                    resultado = "la visión falló 3 veces seguidas"; break
+                time.sleep(1.0); previa = ojos.capturar(); continue
+            fallos = 0
+            self.log.emit(f"🎮 [{n}/{turnos}] {d['razon']}")
+            self._ver(img, f"[{n}] {d['razon']}")
+            hechas = [self._jugada(a, sw, sh) for a in d["acciones"]]
+            if d["fin"]:
+                resultado = d["resultado"] or "partida terminada"; bitacora.append(f"{n}: {d['razon']} -> FIN: {resultado}"); break
+            time.sleep(0.25)
+            ahora = ojos.capturar()
+            self._ver(ahora, f"[{n}] resultado de: {', '.join(hechas)[:90]}")
+            movio = ojos.cambio(img, ahora, 0.003)
+            quietos = 0 if movio else quietos + 1
+            bitacora.append(f"{n}: {d['razon']} -> {', '.join(hechas) or 'sin acciones'}" + ("" if movio else " (la pantalla NO cambió)"))
+            if quietos >= 5:
+                resultado = "la pantalla no reaccionaba a mis acciones (¿el juego no tiene el foco?)"; break
+            previa = ahora
+        else:
+            resultado = f"se acabaron los {turnos} turnos sin terminar la partida"
+        self.log.emit(f"🎮 Fin de la sesión: {resultado}")
+        self._notas.append(f"jugué «{juego}» {len(bitacora)} turnos; resultado: {resultado}")
+        try:
+            if bitacora and self.cerebro.reflexionar_juego(juego, bitacora, resultado):
+                self.log.emit("🧠 Lección de la partida guardada en mi memoria.")
+        except Exception as e:
+            print(f"[Lecciones] {e}")
 
     def _a_cerrar(self, app_name):
         nombre = app_name.lower().replace(".exe", "").replace('"', '').replace("'", "").strip()
@@ -637,11 +1217,15 @@ class Ejecutor(QThread):
 
 
 def powershell_csv(comando_ps):
-    return subprocess.check_output(
-        f'powershell -Command "{comando_ps}"',
-        shell=True, text=True, stderr=subprocess.STDOUT,
-        encoding='mbcs', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW,
-    ).strip()
+    """Ejecuta PowerShell y devuelve su salida; si no hay resultados (código de salida 1) devuelve cadena vacía."""
+    try:
+        return subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", comando_ps],
+            text=True, stderr=subprocess.STDOUT,
+            encoding='mbcs', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return ""
 
 
 # ---------- Widgets ----------
@@ -869,6 +1453,7 @@ class Avatar(QWidget):
         self.estado = "idle"
         self.color = QColor(COLORES["idle"])
         self.nivel = 0.0
+        self.vigilando = False  # escucha por nombre activa: el espectro reacciona a la voz aunque esté en reposo
         self.t = 0.0
         self.rot = 0.0
         self.ondas = []
@@ -931,7 +1516,7 @@ class Avatar(QWidget):
 
         # Espectro radial
         amp = AMP_BASE.get(self.estado, 0.15)
-        if self.estado == "escuchando": amp += self.nivel * 1.5
+        if self.estado == "escuchando" or (self.vigilando and self.estado == "idle"): amp += self.nivel * 1.5
         amp = min(amp, 1.2)
         r0 = radio * 1.5
         cb, sb = math.cos(self.rot * 0.15), math.sin(self.rot * 0.15)
@@ -1325,6 +1910,55 @@ class PanelChat(QWidget):
             p.drawText(QRectF(0, h * 0.30 + 92, w, 24), Qt.AlignCenter, "ESPERANDO COMANDO")
 
 
+class VistaVivo(QWidget):
+    """Ventanita flotante con lo que SAGE está viendo mientras juega (transparente al mouse y excluida de las capturas en Windows)."""
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.resize(400, 292)
+        self._img, self._texto = None, ""
+
+    def poner(self, datos, w, h, texto):
+        if w <= 0 or h <= 0:
+            self.hide(); return
+        self._img = QImage(datos, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        self._texto = texto
+        if not self.isVisible():
+            g = QApplication.primaryScreen().availableGeometry()
+            self.move(g.right() - self.width() - 12, g.top() + 12)
+            self.show()
+            if sys.platform == "win32":
+                try:  # WDA_EXCLUDEFROMCAPTURE: esta ventana no sale en las capturas de SAGE
+                    import ctypes
+                    ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11)
+                except Exception:
+                    pass
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(COLORES["sage"], 2)); p.setBrush(QColor(8, 10, 18, 235))
+        p.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 2), 8, 8)
+        p.setBrush(COLORES["sage"]); p.setPen(Qt.PenStyle.NoPen); p.drawEllipse(QPointF(16, 15), 4, 4)
+        p.setPen(QColor(235, 235, 245)); p.setFont(fuente(8, 2))
+        p.drawText(QRectF(28, 6, 340, 18), Qt.AlignmentFlag.AlignVCenter, "SAGE VE EN VIVO")
+        zona = QRectF(8, 28, self.width() - 16, 216)
+        if self._img is not None:
+            sc = self._img.scaled(int(zona.width()), int(zona.height()), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            p.drawImage(int(zona.x() + (zona.width() - sc.width()) / 2), int(zona.y() + (zona.height() - sc.height()) / 2), sc)
+        p.setPen(QColor(170, 230, 240)); p.setFont(fuente(8))
+        p.drawText(QRectF(10, 248, self.width() - 20, 40), Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap, self._texto)
+
+
+class PuenteEscucha(QObject):
+    """Pasa al hilo de la interfaz lo que ocurre en los hilos de la escucha por nombre."""
+    llamado = Signal(str)
+    fallo = Signal(str)
+
+
 class Ventana(QMainWindow):
     def __init__(self, cerebro):
         super().__init__()
@@ -1348,6 +1982,13 @@ class Ventana(QMainWindow):
         self._rings = 0
         self._texto_pend = ""
         self._pend = ("", False)
+
+        # Escucha por nombre: solo reacciona cuando oye "SAGE" (botón LLAMADO o Ctrl+L)
+        self._ptt_exige_nombre = os.getenv("SAGE_LLAMADO_MIC", "0").strip() == "1"
+        self.puente = PuenteEscucha()
+        self.puente.llamado.connect(self._llamado_voz)
+        self.puente.fallo.connect(self._escucha_fallo)
+        self.escucha = EscuchaContinua(self.puente.llamado.emit, self._escucha_bloqueada, self.puente.fallo.emit, aviso)
 
         self._timer_ui = QTimer(self)
         self._timer_ui.setSingleShot(True)
@@ -1382,6 +2023,10 @@ class Ventana(QMainWindow):
         tel.addWidget(self.lbl_rings)
         tel.addWidget(self.lbl_lat)
 
+        self.btn_escucha = BotonRiders("LLAMADO «SAGE»: OFF", ORO, compacto=True)
+        self.btn_escucha.setToolTip("Escucha el micrófono sin parar y solo responde cuando dices «SAGE» (Ctrl+L)")
+        self.btn_escucha.clicked.connect(self.toggle_escucha)
+
         self.chk_top = QCheckBox("FIJAR HUD")
         self.chk_top.toggled.connect(self._siempre_encima)
 
@@ -1389,6 +2034,8 @@ class Ventana(QMainWindow):
         izq.addWidget(self.estado_lbl)
         izq.addSpacing(10)
         izq.addLayout(tel)
+        izq.addWidget(self.btn_escucha)
+        izq.addSpacing(4)
         izq.addWidget(self.chk_top)
         cuerpo.addLayout(izq, 2)
 
@@ -1400,7 +2047,7 @@ class Ventana(QMainWindow):
         fila = QHBoxLayout()
         fila.setSpacing(8)
         self.entrada = QLineEdit()
-        self.entrada.setPlaceholderText("Comando o enlace vocal... (Ctrl+M = Micrófono)")
+        self.entrada.setPlaceholderText("Comando... (Ctrl+M mic · Ctrl+L llamado SAGE)")
         self.entrada.returnPressed.connect(self.enviar)
 
         self.btn_mic = BotonRiders("MICRÓFONO", COLORES["escuchando"])
@@ -1420,6 +2067,7 @@ class Ventana(QMainWindow):
         cuerpo.addLayout(der, 3)
 
         QShortcut(QKeySequence("Ctrl+M"), self, activated=self._atajo_mic)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self.toggle_escucha)
 
         # Reloj único: anima todos los widgets y repinta la ventana una sola vez por fotograma
         self._ult = time.perf_counter()
@@ -1427,10 +2075,12 @@ class Ventana(QMainWindow):
         self._reloj.timeout.connect(self._frame)
         self._reloj.start(FPS_MS)
 
-        self._set_estado("idle", "SISTEMA ONLINE")
+        self._set_estado("idle", self._texto_idle())
         self.entrada.setFocus()
 
         self._correr(Tarea(self._calentar))
+        if os.getenv("SAGE_ESCUCHA_AUTO", "0").strip() == "1":
+            QTimer.singleShot(1500, self.toggle_escucha)
 
         self.setWindowOpacity(0.0)
         self._fade = QPropertyAnimation(self, b"windowOpacity", self)
@@ -1453,7 +2103,12 @@ class Ventana(QMainWindow):
         if self.isMinimized() or not self.isVisible():
             return
 
-        destino = min(1.0, getattr(self.grabadora_actual, "nivel", 0.0) * 7) if self.grabando_tipo else 0.0
+        if self.grabando_tipo:
+            destino = min(1.0, getattr(self.grabadora_actual, "nivel", 0.0) * 7)
+        elif self.escucha.activa and self._estado == "idle":
+            destino = min(1.0, self.escucha.nivel * 7)
+        else:
+            destino = 0.0
         self._nivel += (destino - self._nivel) * min(1.0, dt * 8.6)
         self.avatar.nivel = self._nivel
 
@@ -1523,6 +2178,8 @@ class Ventana(QMainWindow):
             ej = Ejecutor(acciones, self.cerebro, self._texto_pend)
             ej.log.connect(self._log_sistema)
             ej.hud.connect(self._mostrar_hud)
+            if not hasattr(self, "_vista"): self._vista = VistaVivo()
+            ej.vista.connect(self._vista.poner)
             ej.finished.connect(self._fin_ejecucion)
             ej.finished.connect(lambda t=ej: self._tareas.discard(t))
             self._tareas.add(ej)
@@ -1580,8 +2237,10 @@ class Ventana(QMainWindow):
 
         if self.grabando_tipo != "mic":
             self.grabadora_actual = self.grabadora_mic
+            self.escucha.suspender()  # el micrófono lo usa la grabación manual; la escucha por nombre se reanuda al terminar
             try: self.grabadora_actual.iniciar()
             except Exception as e:
+                self.escucha.reanudar()
                 self._agregar("Sistema", f"No se pudo enlazar micrófono: {e}")
                 return
             self.grabando_tipo = "mic"
@@ -1596,7 +2255,7 @@ class Ventana(QMainWindow):
             self.btn_pc.setEnabled(True)
             self.btn_mic.setEnabled(False)
             self._set_estado("pensando", "DECODIFICANDO...")
-            self._lanzar(Tarea(transcribir, audio), self._transcripcion_ok, self._mic_error)
+            self._lanzar(Tarea(transcribir, audio), self._transcripcion_mic_ok, self._mic_error)
 
     # --- AUDIO PC / DISCORD (LOOPBACK) ---
     def toggle_pc(self):
@@ -1623,10 +2282,57 @@ class Ventana(QMainWindow):
             self._set_estado("pensando", "DECODIFICANDO PC...")
             self._lanzar(Tarea(transcribir, audio), self._transcripcion_ok, self._mic_error)
 
-    def _transcripcion_ok(self, texto):
+    def _transcripcion_mic_ok(self, texto):
+        self._transcripcion_ok(texto, self._ptt_exige_nombre)
+
+    def _transcripcion_ok(self, texto, exigir_nombre=False):
         if not texto:
             self._agregar("Sistema", "Señal vacía, reintente.")
             self._listo()
+            return
+        if exigir_nombre and not fue_llamada(texto):
+            print(f"[Escucha] Ignorado (di SAGE al principio): «{texto}»")
+            self._listo()
+            return
+        if exigir_nombre:
+            aviso()
+        self._agregar("Niko", texto)
+        self._pedir_respuesta(texto)
+
+    # --- LLAMADO POR NOMBRE ("SAGE") ---
+    def _texto_idle(self):
+        return "ESPERANDO «SAGE»" if self.escucha.activa else "SISTEMA ONLINE"
+
+    def _escucha_bloqueada(self):
+        """Se llama desde el hilo de audio: la escucha se calla mientras SAGE habla, piensa, ejecuta o se graba a mano."""
+        return bool(self.grabando_tipo) or self._estado != "idle" or esta_hablando()
+
+    def _sincronizar_escucha(self):
+        activa = self.escucha.activa
+        self.avatar.vigilando = activa
+        self.btn_escucha.setText("LLAMADO «SAGE»: ON" if activa else "LLAMADO «SAGE»: OFF")
+        self.btn_escucha.base = QColor(COLORES["idle"] if activa else ORO)
+        self.btn_escucha.update()
+        if self._estado == "idle":
+            self.estado_lbl.setText(self._texto_idle())
+
+    def toggle_escucha(self):
+        if self.escucha.activa:
+            self.escucha.detener()
+        else:
+            try: self.escucha.iniciar()
+            except Exception as e:
+                self._agregar("Sistema", f"No se pudo activar la escucha por nombre: {e}")
+                return
+        self._sincronizar_escucha()
+
+    def _escucha_fallo(self, msg):
+        self._agregar("Sistema", f"Escucha por nombre: {msg}")
+        self._sincronizar_escucha()
+
+    def _llamado_voz(self, texto):
+        """Alguien dijo «SAGE ...» con la escucha activa (llega ya en el hilo de la interfaz)."""
+        if self._estado != "idle" or self.grabando_tipo:
             return
         self._agregar("Niko", texto)
         self._pedir_respuesta(texto)
@@ -1644,8 +2350,9 @@ class Ventana(QMainWindow):
         self._bloquear(False)
         self.btn_mic.setEnabled(True)
         self.btn_pc.setEnabled(True)
-        self._set_estado("idle", "SISTEMA ONLINE")
+        self._set_estado("idle", self._texto_idle())
         self.entrada.setFocus()
+        self.escucha.reanudar()  # no hace nada si la escucha por nombre no estaba suspendida
 
     def _correr(self, tarea, **senales):
         for nombre, slot in senales.items():
@@ -1699,7 +2406,7 @@ class Ventana(QMainWindow):
 
         if intencion.get("ver_procesos", False):
             try:
-                objetivo = RE_SEGURO.sub('', intencion.get("objetivo_proceso", "")).strip()
+                objetivo = RE_SEGURO.sub('', intencion.get("objetivo_proceso", "")).replace(" ", "").strip()  # "geometry dash" -> GeometryDash
                 cols = "Select-Object ProcessName, MainWindowTitle | ConvertTo-Csv -NoTypeInformation"
                 if objetivo:
                     info = powershell_csv(f"Get-Process *{objetivo}* -ErrorAction SilentlyContinue | {cols}")
@@ -1724,19 +2431,31 @@ class Ventana(QMainWindow):
         )
 
     def closeEvent(self, ev):
+        if hasattr(self, "_vista"): self._vista.close()
+        self.escucha.detener()
         if self.grabando_tipo and self.grabadora_actual:
             self.grabadora_actual.detener()
         super().closeEvent(ev)
 
 
 def main():
+    if sys.platform == "win32":
+        try:  # sin esto Windows agrupa la ventana bajo python.exe y muestra su icono en la barra de tareas
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("nexus.sage.asistente")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    if os.path.exists(RUTA_ICONO):
+        app.setWindowIcon(QIcon(RUTA_ICONO))
     app.setStyleSheet(ESTILO)
     try: cerebro = Cerebro()
     except Exception as e:
         QMessageBox.critical(None, "Fallo Crítico de SAGE", str(e))
         return 1
     ventana = Ventana(cerebro)
+    if os.path.exists(RUTA_ICONO):
+        ventana.setWindowIcon(QIcon(RUTA_ICONO))
     ventana.show()
     return app.exec()
 

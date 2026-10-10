@@ -36,7 +36,7 @@ _pendientes = 0
 _epoca = 0  # sube con cada callar(): descarta todo lo que venga de antes
 
 _RE_CODIGO = re.compile(r"```.*?```", re.DOTALL)
-_RE_DIRECTIVA = re.compile(r"\[(?:ABRIR|ENFOCAR|CERRAR|ESCRIBIR|TECLA|PULSAR|BUSCAR|CLICK|SCROLL|ESPERAR|CIRCULOS|APAGAR)\b[^\]]*\]", re.IGNORECASE)
+_RE_DIRECTIVA = re.compile(r"\[(?:ABRIR|ENFOCAR|CERRAR|ESCRIBIR|TECLA|PULSAR_DER|PULSAR|BUSCAR|ATAJO|ARRASTRAR|DESCARGAR|DIBUJAR|TRAZO|JUGAR|CLICK_DER|CLICK|SCROLL|ESPERAR|CIRCULOS|APAGAR)\b[^\]]*\]", re.IGNORECASE)
 _RE_URL = re.compile(r"https?://\S+")
 
 
@@ -215,3 +215,41 @@ def cerrar():
     callar()
     cola_texto.put(None)
     cola_audio.put(None)
+
+
+# =====================================================================
+#  SONIDO DE "TE ESCUCHO" (campanita suave generada por código, sin archivos)
+# =====================================================================
+_sonido_aviso = None
+
+
+def _crear_aviso():
+    import numpy as np
+    init = pygame.mixer.get_init()
+    if not init:
+        return None
+    tasa, _, canales = init
+    def nota(f, dur, vol):
+        t = np.linspace(0, dur, int(tasa * dur), endpoint=False)
+        env = np.minimum(1, t / 0.01) * np.exp(-t * 14)           # ataque suave y caída rápida
+        return vol * env * (np.sin(2 * np.pi * f * t) + 0.25 * np.sin(2 * np.pi * 2 * f * t))
+    gap = np.zeros(int(tasa * 0.05))
+    onda = np.concatenate([nota(880, 0.16, 0.5), gap, nota(1318, 0.24, 0.5)])
+    onda = (onda / max(1e-6, np.abs(onda).max()) * 0.35 * 32767).astype(np.int16)
+    if canales == 2:
+        onda = np.column_stack([onda, onda])
+    return pygame.sndarray.make_sound(np.ascontiguousarray(onda))
+
+
+def aviso():
+    """Ruidito suave: 'te escuché, dime'. No bloquea ni interfiere con la voz."""
+    global _sonido_aviso
+    if not _MIXER_OK:
+        return
+    try:
+        if _sonido_aviso is None:
+            _sonido_aviso = _crear_aviso()
+        if _sonido_aviso is not None:
+            _sonido_aviso.play()
+    except Exception as e:
+        print(f"[SAGE AUDIO] Aviso no disponible: {e}")

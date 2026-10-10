@@ -6,6 +6,8 @@ edge-tts
 pygame
 scipy
 pillow
+mss
+numpy
 pyaudiowpatch; sys_platform == "win32"
 
 # --- Versiones fijadas (pip freeze) ---
