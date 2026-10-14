@@ -2,8 +2,12 @@
 
 Se usa para que SAGE sepa cuándo una página terminó de cargar (la pantalla deja de cambiar)
 y para confirmar que una acción (click, escritura...) realmente tuvo efecto.
+
+Velocidad: si tienes `mss` instalado (pip install mss) la captura es ~3x más rápida que con Pillow;
+si no está, se usa Pillow como siempre.
 """
 import time
+import threading
 
 import numpy as np
 
@@ -12,9 +16,33 @@ _DELTA_PIXEL = 20            # cuánto debe variar un píxel (0-255) para contar
 UMBRAL_ESTABLE = 0.003       # fracción de píxeles cambiados por debajo de la cual la pantalla está "quieta"
 UMBRAL_CAMBIO = 0.010        # fracción mínima para considerar que una acción cambió la pantalla
 
+_local = threading.local()   # mss necesita una instancia por hilo
+_mss_ok = True               # se desactiva solo si falla una vez
+
+
+def _capturar_mss():
+    global _mss_ok
+    try:
+        import mss
+        from PIL import Image
+        sct = getattr(_local, "sct", None)
+        if sct is None:
+            sct = _local.sct = mss.mss()
+        bruto = sct.grab(sct.monitors[1])   # monitor principal, igual que ImageGrab.grab()
+        return Image.frombytes("RGB", bruto.size, bruto.bgra, "raw", "BGRX")
+    except ImportError:
+        _mss_ok = False
+    except Exception:
+        _local.sct = None                   # la instancia pudo quedar inválida: se recrea en el próximo intento
+    return None
+
 
 def capturar():
     """Captura la pantalla principal como imagen PIL (o None si falla)."""
+    if _mss_ok:
+        img = _capturar_mss()
+        if img is not None:
+            return img
     try:
         from PIL import ImageGrab
         return ImageGrab.grab()
@@ -30,9 +58,17 @@ def huella(img):
     if isinstance(img, np.ndarray):
         return img
     try:
-        return np.asarray(img.convert("L").resize((_ANCHO, _ALTO)), dtype=np.int16)
+        # reduce() (promedio por cajas) es mucho más rápido que convertir a gris toda la imagen y luego escalar
+        f = max(1, min(img.width // _ANCHO, img.height // _ALTO))
+        peq = img.reduce(f) if f > 1 else img
+        if peq.size != (_ANCHO, _ALTO):
+            peq = peq.resize((_ANCHO, _ALTO))
+        return np.asarray(peq.convert("L"), dtype=np.int16)
     except Exception:
-        return None
+        try:
+            return np.asarray(img.convert("L").resize((_ANCHO, _ALTO)), dtype=np.int16)
+        except Exception:
+            return None
 
 
 def diferencia(a, b):
@@ -47,8 +83,8 @@ def cambio(antes, despues, umbral=UMBRAL_CAMBIO):
     return diferencia(antes, despues) > umbral
 
 
-def esperar_estable(timeout=20.0, intervalo=0.3, estables=3, minimo=0.8,
-                    requerir_cambio=False, espera_sin_cambio=4.0, umbral=UMBRAL_ESTABLE):
+def esperar_estable(timeout=20.0, intervalo=0.12, estables=3, minimo=0.4,
+                    requerir_cambio=False, espera_sin_cambio=2.0, umbral=UMBRAL_ESTABLE):
     """Bloquea hasta que la pantalla deja de cambiar (p. ej. una página terminó de cargar).
 
     - estables: cuántas comparaciones seguidas deben salir "quietas" (estables * intervalo = calma mínima).

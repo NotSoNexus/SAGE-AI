@@ -1,0 +1,9 @@
+{
+  "dispositivos": {
+    "celular": {
+      "tipo": "android",
+      "direccion": "auto",
+      "alias": []
+    }
+  }
+}

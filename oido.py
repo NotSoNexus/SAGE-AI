@@ -14,7 +14,7 @@ import numpy as np
 FS = 16000  # Whisper trabaja a 16 kHz mono
 MAX_SEGUNDOS = 300  # tope de grabación para no llenar la RAM
 
-VOCABULARIO = "SAGE, Niko, Wiwi, Nexus, Cierra, Sonic ReDust, Godot, GDScript, Unreal Engine, Blender, Chill, blueprints, shaders, rigging, open world, play, enter, Discord, YouTube."
+VOCABULARIO = "SAGE, Niko, Wiwi, Outcome Memories, Frutiger Aero, Nexus, Cierra, Sonic ReDust, Godot, GDScript, Unreal Engine, Blender, Chill, blueprints, shaders, rigging, open world, play, enter, Discord, YouTube."
 
 # Frases fantasma típicas de Whisper cuando solo hay ruido o silencio
 _ALUCINACIONES_EXACTAS = {"música", "musica", "subtítulos", "subtitulos", "gracias por ver", "suscríbete", "suscribete"}
@@ -45,8 +45,8 @@ def _remuestrear(audio, origen, destino=FS):
 def _normalizar(audio):
     """Sube el volumen de grabaciones muy bajas (máx. x8) para que el VAD y Whisper las detecten."""
     pico = float(np.max(np.abs(audio))) if audio.size else 0.0
-    if 1e-4 < pico < 0.3:
-        audio = audio * min(8.0, 0.6 / pico)
+    if 2e-5 < pico < 0.3:
+        audio = audio * min(40.0, 0.6 / pico)
     return audio.astype(np.float32, copy=False)
 
 
@@ -58,11 +58,83 @@ def _dispositivo_entrada():
     except ValueError: return val
 
 
+def listar_entradas():
+    """Los micrófonos que ve el sistema de audio, para diagnosticar: '1: Micrófono (Realtek) [MME]; ...'."""
+    try:
+        import sounddevice as sd
+        dispositivos, apis = sd.query_devices(), sd.query_hostapis()
+        return "; ".join(f"{i}: {d['name']} [{apis[d['hostapi']]['name']}]"
+                         for i, d in enumerate(dispositivos) if d.get("max_input_channels", 0) > 0) or "(ninguno)"
+    except Exception as e:
+        return f"(no pude listarlos: {e})"
+
+
+def candidatos_entrada(sd, excluir=()):
+    """Micrófonos a probar, por orden: el de .env (MIC_DEVICE) o el predeterminado, y luego cualquier otra entrada
+    (primero las de la misma API de audio que la predeterminada)."""
+    cand = [_dispositivo_entrada()]
+    try:
+        dispositivos = sd.query_devices()
+        pred = sd.default.device[0]
+        host_def = dispositivos[pred]["hostapi"] if pred is not None and pred >= 0 else -1
+        entradas = [(0 if d.get("hostapi") == host_def else 1, i) for i, d in enumerate(dispositivos) if d.get("max_input_channels", 0) > 0]
+        cand += [i for _, i in sorted(entradas)]
+    except Exception:
+        pass
+    vistos, res = set(), []
+    for c in cand:
+        if c not in vistos and c not in excluir:
+            vistos.add(c)
+            res.append(c)
+    return res
+
+
+def abrir_entrada(recibir, bloque_fs=None, excluir=()):
+    """Abre el primer micrófono que funcione y llama a recibir(mono, tasa) con cada bloque (ya mezclado a mono).
+    Prueba: el micrófono elegido/predeterminado y luego los demás; la tasa de 16 kHz y la nativa del dispositivo
+    (muchos micrófonos de Windows no admiten 16 kHz); estéreo mezclado a mono (si el canal 0 está vacío no se pierde la voz).
+    Devuelve (stream, dispositivo, nombre, tasa, es_alternativo)."""
+    import sounddevice as sd  # import aquí para dar un error claro si falta
+
+    ultimo, primero = None, True
+    for dev in candidatos_entrada(sd, excluir):
+        try:
+            info = sd.query_devices(dev, "input")
+        except Exception as e:
+            ultimo, primero = e, False
+            continue
+        canales = max(1, min(2, int(info.get("max_input_channels", 1) or 1)))
+        tasas = [FS]
+        nativa = int(info.get("default_samplerate", 0) or 0)
+        if nativa and nativa != FS: tasas.append(nativa)
+        for tasa in tasas:
+            for ch in ([canales] if canales == 1 else [canales, 1]):
+                stream = None
+
+                def cb(indata, frames, tiempo, status, tasa=tasa):
+                    recibir(indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0], tasa)
+
+                try:
+                    bloque = int(round(bloque_fs * tasa / FS)) if bloque_fs else 0
+                    stream = sd.InputStream(samplerate=tasa, channels=ch, dtype="float32", blocksize=bloque, callback=cb, device=dev)
+                    stream.start()
+                    return stream, dev, str(info.get("name", dev)), tasa, not primero
+                except Exception as e:
+                    ultimo = e
+                    if stream is not None:
+                        try: stream.close()
+                        except Exception: pass
+        primero = False
+    raise RuntimeError(f"No pude abrir ningún micrófono: {ultimo}")
+
+
 class _GrabadoraBase:
     def __init__(self):
         self._frames = []
         self._muestras = 0
         self._tasa = FS
+        self.pico = 0.0   # volumen máximo de la última grabación (sin normalizar): 0 = el micrófono no envió nada
+        self.nombre = ""
         self.nivel = 0.0  # volumen RMS actual (0..~1), lo usa la UI para el visualizador
 
     def _reiniciar(self):
@@ -80,8 +152,10 @@ class _GrabadoraBase:
     def _finalizar(self, tasa):
         self.nivel = 0.0
         if not self._frames:
+            self.pico = 0.0
             return np.zeros(0, dtype=np.float32)
         audio = np.concatenate(self._frames)
+        self.pico = float(np.max(np.abs(audio))) if audio.size else 0.0
         self._frames = []
         self._muestras = 0
         return _normalizar(_remuestrear(audio, tasa))
@@ -107,27 +181,18 @@ class Grabadora(_GrabadoraBase):
             self._stream = None
 
     def iniciar(self):
-        import sounddevice as sd  # import aquí para dar un error claro si falta
-
         self._cerrar()  # evita fugas si se llama dos veces seguidas
         self._reiniciar()
-
-        def callback(indata, frames, tiempo, status):
-            self._acumular(indata[:, 0], FS)
-
         try:
-            self._stream = sd.InputStream(
-                samplerate=FS, channels=1, dtype="float32",
-                callback=callback, device=_dispositivo_entrada(),
-            )
-            self._stream.start()
+            self._stream, _, self.nombre, self._tasa, _ = abrir_entrada(self._acumular)
+            print(f"[Micrófono] Grabando con: {self.nombre} ({self._tasa} Hz)")
         except Exception:
             self._cerrar()
             raise
 
     def detener(self):
         self._cerrar()
-        return self._finalizar(FS)
+        return self._finalizar(self._tasa)
 
 
 def _buscar_loopback(p):
@@ -287,8 +352,8 @@ def precargar():
             if _modelo is None:
                 from faster_whisper import WhisperModel
 
-                # "medium" = precisión casi humana. Si tu PC va lenta, WHISPER_MODEL=small en .env
-                nombre = os.getenv("WHISPER_MODEL", "medium")
+                # "small" = ~3x más rápido que "medium" con muy buena precisión en español. Para máxima precisión: WHISPER_MODEL=medium en .env
+                nombre = os.getenv("WHISPER_MODEL", "small")
                 dispositivo = os.getenv("WHISPER_DEVICE", "cpu")
                 tipo = "float16" if dispositivo == "cuda" else "int8"
                 _modelo = WhisperModel(
@@ -305,7 +370,7 @@ def _es_alucinacion(texto):
 
 
 def transcribir(audio, beam=None):
-    """Convierte audio (float32, 16 kHz) en texto. beam: precisión/velocidad (por defecto WHISPER_BEAM, 5)."""
+    """Convierte audio (float32, 16 kHz) en texto. beam: precisión/velocidad (por defecto WHISPER_BEAM, 2)."""
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
@@ -314,8 +379,8 @@ def transcribir(audio, beam=None):
 
     modelo = precargar()
     if beam is None:
-        try: beam = max(1, int(os.getenv("WHISPER_BEAM", "5")))
-        except ValueError: beam = 5
+        try: beam = max(1, int(os.getenv("WHISPER_BEAM", "2")))
+        except ValueError: beam = 2
 
     # Un solo hilo a la vez: la escucha por nombre y el micrófono manual comparten el mismo modelo.
     with _lock_transcripcion:
@@ -327,8 +392,8 @@ def transcribir(audio, beam=None):
             condition_on_previous_text=False,
             without_timestamps=True,
             vad_filter=True,
-            # No cortar palabras a la mitad y dejar margen de 400 ms
-            vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=400),
+            # No cortar palabras a la mitad y dejar margen de 400 ms; umbral más bajo para no tirar voz suave
+            vad_parameters=dict(threshold=0.35, min_silence_duration_ms=200, speech_pad_ms=250),
             initial_prompt=VOCABULARIO,
         )
         # `segmentos` es un generador: se consume aquí dentro, con el candado puesto.
@@ -351,17 +416,31 @@ class EscuchaContinua:
     - bloqueado(): devuelve True mientras SAGE habla, piensa o se graba a mano; durante ese tiempo no se
       atiende nada (así no se escucha a sí misma ni se pisa con otra acción).
     - al_llamado(texto): se invoca desde un hilo con la frase completa cuando la llamaron.
-    Ajustes opcionales en .env: ESCUCHA_UMBRAL (volumen mínimo de voz, 0.008) y WHISPER_BEAM_ESCUCHA (2).
+    Ajustes opcionales en .env: ESCUCHA_UMBRAL (volumen mínimo de voz, 0.002; el umbral real se adapta solo al ruido de
+    fondo), MIC_DEVICE (micrófono concreto), ESCUCHA_DEBUG=1 (imprime el nivel del micrófono) y WHISPER_BEAM_ESCUCHA.
     """
 
     PRE_ROLL = 0.5         # s de audio previo al inicio de la voz (para no cortar la primera sílaba)
-    FIN_SILENCIO = 0.8     # s de silencio que cierran una frase
+    FIN_SILENCIO = 0.55    # s de silencio que cierran una frase
     MIN_VOZ = 0.25         # s mínimos de voz para que valga la pena transcribir
     MAX_ENUNCIADO = 20.0   # s máximos por frase
     VENTANA_ORDEN = 10.0   # s que SAGE espera tu orden después de oír solo su nombre
-    COOLDOWN = 0.9         # s de calma tras haber estado bloqueada (cola de la voz de SAGE, ecos)
+    COOLDOWN = 0.5         # s de calma tras haber estado bloqueada (cola de la voz de SAGE, ecos)
+    GRACIA_HABLA = 0.35    # s al empezar a hablar SAGE en los que solo se mide su eco (sin interrumpir)
+    FACTOR_ECO = 2.2       # tu voz debe superar el eco medido de SAGE por este factor
 
-    def __init__(self, al_llamado, bloqueado=None, al_error=None, al_aviso=None):
+    def __init__(self, al_llamado, bloqueado=None, al_error=None, al_aviso=None, interrumpible=None, al_interrumpir=None):
+        self.interrumpible = interrumpible      # () -> True mientras SAGE está hablando y se la puede cortar
+        self.al_interrumpir = al_interrumpir    # () -> se invoca (hilo de audio) cuando empiezas a hablar encima de ella
+        try: self.umbral_interrupcion = float(os.getenv("SAGE_INTERRUMPIR_UMBRAL", "0.035"))
+        except ValueError: self.umbral_interrupcion = 0.035
+        try: self.min_interrupcion = max(0.1, float(os.getenv("SAGE_INTERRUMPIR_MS", "250")) / 1000.0)
+        except ValueError: self.min_interrupcion = 0.25
+        if os.getenv("SAGE_INTERRUMPIR", "1").strip() == "0": self.al_interrumpir = None
+        self._eco = 0.0
+        self._voz_encima = 0.0
+        self._sage_hablaba = False
+        self._t_habla = 0.0
         self.al_llamado = al_llamado
         self.al_aviso = al_aviso      # ruidito de «te escucho»
         self._armada_hasta = 0.0      # tras decir solo «SAGE», la siguiente frase es la orden (sin repetir el nombre)
@@ -376,11 +455,18 @@ class EscuchaContinua:
         self._transcribir = transcribir  # sustituible en pruebas
         self._ult_error = 0.0
         self._bloqueado_hasta = 0.0
-        self._piso = 0.003
-        try: self.umbral_min = float(os.getenv("ESCUCHA_UMBRAL", "0.008"))
-        except ValueError: self.umbral_min = 0.008
-        try: self.beam = max(1, int(os.getenv("WHISPER_BEAM_ESCUCHA", "2")))
-        except ValueError: self.beam = 2
+        self._piso = 0.001
+        try: self.umbral_min = float(os.getenv("ESCUCHA_UMBRAL", "0.002"))
+        except ValueError: self.umbral_min = 0.002
+        self._tasa = FS               # tasa real con la que se abrió el micrófono (si no admite 16 kHz se remuestrea)
+        self._nombre_disp = ""
+        self._ult_bloque = 0.0        # cuándo llegó el último bloque de audio (vigilancia del stream)
+        self._t_abierto = 0.0
+        self._max_rms = 0.0           # volumen máximo desde que se abrió (detecta un micrófono mudo)
+        self._t_debug = 0.0
+        self._debug = os.getenv("ESCUCHA_DEBUG", "").strip() == "1"
+        try: self.beam = max(1, int(os.getenv("WHISPER_BEAM_ESCUCHA", "1")))
+        except ValueError: self.beam = 1
         self._reiniciar_vad()
 
     # ---------- control ----------
@@ -417,19 +503,20 @@ class EscuchaContinua:
 
     # ---------- micrófono ----------
     def _abrir(self):
-        import sounddevice as sd  # import aquí para dar un error claro si falta
-
         self._cerrar()
         self._reiniciar_vad()
         try:
-            self._stream = sd.InputStream(
-                samplerate=FS, channels=1, dtype="float32", blocksize=ESCUCHA_BLOQUE,
-                callback=self._callback, device=_dispositivo_entrada(),
-            )
-            self._stream.start()
+            stream, dev, nombre, tasa, alterno = abrir_entrada(self._recibir, ESCUCHA_BLOQUE)
         except Exception:
             self._cerrar()
             raise
+        self._stream, self._nombre_disp, self._tasa = stream, nombre, tasa
+        self._ult_bloque = self._t_abierto = time.monotonic()
+        self._max_rms = 0.0
+        print(f"[Escucha] Micrófono en uso: {nombre} ({tasa} Hz)")
+        if alterno:
+            self._error(f"El micrófono predeterminado no se pudo abrir; uso «{nombre}». "
+                        "Si no es el correcto, pon MIC_DEVICE=<nombre o número> en .env.")
 
     def _cerrar(self):
         if self._stream is not None:
@@ -440,9 +527,12 @@ class EscuchaContinua:
                 pass
             self._stream = None
 
-    def _callback(self, indata, frames, tiempo, status):
+    def _recibir(self, mono, tasa):
         try:
-            self._procesar_bloque(indata[:, 0])
+            self._ult_bloque = time.monotonic()
+            if tasa != FS:
+                mono = _remuestrear(np.array(mono, dtype=np.float32, copy=True), tasa)
+            self._procesar_bloque(mono)
         except Exception as e:  # una excepción aquí cerraría el stream de audio
             print(f"[Escucha] {e}")
 
@@ -460,11 +550,22 @@ class EscuchaContinua:
         ahora = time.monotonic() if ahora is None else ahora
         rms = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
         self.nivel = rms
+        if rms > self._max_rms: self._max_rms = rms
 
         if self.bloqueado():
+            if self.al_interrumpir and self.interrumpible and self.interrumpible():
+                if self._vigilar_interrupcion(mono, rms, ahora):
+                    return
+                # sigue bloqueada, pero conserva el pre-roll (self._pre) para no perder tus primeras sílabas
+                self._hablando, self._buf, self._ruido_seg = False, [], 0.0
+                self._bloqueado_hasta = ahora + self.COOLDOWN
+                return
+            self._sage_hablaba = False
             self._bloqueado_hasta = ahora + self.COOLDOWN
             self._reiniciar_vad()
             return
+        self._sage_hablaba = False
+        self._voz_encima = 0.0
         if ahora < self._bloqueado_hasta:
             return
 
@@ -489,6 +590,8 @@ class EscuchaContinua:
 
         self._buf.append(bloque)
         self._total += dur
+        if self._total > 6.0:   # una "frase" tan larga suele ser ruido continuo: que el umbral suba y deje de dispararse
+            self._piso += (rms - self._piso) * 0.004
         if rms > umbral * 0.7:
             self._silencio = 0.0
             self._voz += dur
@@ -501,6 +604,40 @@ class EscuchaContinua:
             if voz >= self.MIN_VOZ:
                 self._enviar(audio)
 
+    def _vigilar_interrupcion(self, mono, rms, ahora):
+        """SAGE está hablando: si empiezas a hablar encima (sostenido, más fuerte que su propio eco) la corta
+        y empieza a capturar tu frase con el pre-roll. Devuelve True si interrumpió."""
+        self._pre.append(np.array(mono, dtype=np.float32, copy=True))
+        dur = mono.size / FS
+        if not self._sage_hablaba:                      # acaba de empezar a hablar: medir su eco antes de juzgar
+            self._sage_hablaba, self._t_habla, self._eco, self._voz_encima = True, ahora, 0.0, 0.0
+        if ahora - self._t_habla < self.GRACIA_HABLA:
+            self._eco += (rms - self._eco) * 0.3
+            return False
+        umbral = max(self.umbral_interrupcion, self._eco * self.FACTOR_ECO)
+        if rms <= umbral:
+            self._eco += (rms - self._eco) * 0.03
+            self._voz_encima = 0.0
+            return False
+        self._voz_encima += dur
+        if self._voz_encima < self.min_interrupcion:
+            return False
+
+        n = int((self.min_interrupcion + 0.15) * FS / ESCUCHA_BLOQUE) + 1
+        self._buf = list(self._pre)[-n:]
+        self._hablando = True
+        self._silencio = 0.0
+        self._ruido_seg = 0.0
+        self._total = sum(b.size for b in self._buf) / FS
+        self._voz = self._voz_encima
+        self._voz_encima = 0.0
+        self._sage_hablaba = False
+        self._bloqueado_hasta = 0.0
+        print("[Escucha] Interrupción por voz: SAGE se calla.")
+        try: self.al_interrumpir()
+        except Exception as e: print(f"[Escucha] {e}")
+        return True
+
     def _enviar(self, audio):
         try: self._cola.put_nowait(audio)
         except queue.Full: pass  # Whisper va atrasado: se descarta la frase más reciente
@@ -511,8 +648,34 @@ class EscuchaContinua:
             except queue.Empty: break
 
     # ---------- transcripción y filtro por nombre ----------
+    def _vigilar_micro(self):
+        """Detecta un micrófono que se quedó mudo (desenchufado, cambio de dispositivo, permisos) y lo reabre."""
+        try:
+            if not self.activa or self._stream is None:
+                return
+            ahora = time.monotonic()
+            if self._debug and ahora - self._t_debug > 2.0:
+                self._t_debug = ahora
+                print(f"[Escucha] «{self._nombre_disp}» nivel={self.nivel:.4f} máx={self._max_rms:.4f} "
+                      f"ruido={self._piso:.4f} umbral={max(self.umbral_min, self._piso * 3.0):.4f}")
+            if ahora - self._ult_bloque > 4.0:        # el stream dejó de entregar audio
+                self._error("El micrófono dejó de enviar audio; lo reabro...")
+                self._ult_bloque = ahora
+                try: self._abrir()
+                except Exception as e:
+                    self.activa = False
+                    self._error(f"No pude reabrir el micrófono: {e}")
+            elif self._max_rms < 1e-5 and ahora - self._t_abierto > 8.0:    # abierto pero silencio digital absoluto
+                self._t_abierto = ahora
+                self._error(f"El micrófono «{self._nombre_disp}» solo entrega silencio absoluto. Revisa que no esté silenciado y que en Windows > "
+                            "Configuración > Privacidad y seguridad > Micrófono estén activados «Acceso al micrófono» y «Permitir que las aplicaciones "
+                            f"de escritorio accedan a tu micrófono». Para usar otro, pon MIC_DEVICE=<número o nombre> en .env. Entradas: {listar_entradas()}")
+        except Exception as e:
+            print(f"[Escucha] vigilancia: {e}")
+
     def _trabajar(self):
         while not self._parar.is_set():
+            self._vigilar_micro()
             try: audio = self._cola.get(timeout=0.3)
             except queue.Empty: continue
             if self.bloqueado():

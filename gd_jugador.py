@@ -17,11 +17,7 @@ Cómo aprende (Geometry Dash es determinista: el mismo nivel pide los mismos sal
 - Lo aprendido se guarda en gd_aprendizaje.json para la próxima vez (compatible con los registros antiguos por tramos de tiempo).
 - Se detiene con F8, al pasar SAGE_GD_MINUTOS (10) o si el cubo no vuelve a aparecer en 4 s (nivel completado, pausa o menú).
 
-Recompensas (felicidad): el juego no expone el % del nivel, así que SAGE lo ESTIMA por tiempo (tiempo vivo / duración del nivel). La duración se mide sola
-al completar el nivel (se guarda en gd_aprendizaje.json); hasta entonces se usa una duración aproximada (SAGE_GD_DURACION la fija a mano). Cada vez que el
-% sube, SAGE recibe una recompensa de felicidad (felicidad.py): pequeña por avanzar, mayor si supera su récord de progreso, y grande al completar el nivel.
-
-Ajustes en .env (opcionales): SAGE_GD_FPS=60, SAGE_GD_VISTA_FPS=30, SAGE_GD_TOQUE=0.07, SAGE_GD_OSCURO=55, SAGE_GD_COLOR=125,255,0, SAGE_GD_DURACION=65
+Ajustes en .env (opcionales): SAGE_GD_FPS=60, SAGE_GD_VISTA_FPS=30, SAGE_GD_TOQUE=0.07, SAGE_GD_OSCURO=55, SAGE_GD_COLOR=125,255,0
 """
 import os
 import sys
@@ -49,10 +45,6 @@ FPS = _num("SAGE_GD_FPS", 60, 20, 144, int)          # fotogramas por segundo ob
 VISTA_FPS = _num("SAGE_GD_VISTA_FPS", 30, 5, 60, int)  # fotogramas por segundo de la ventanita «SAGE ve en vivo»
 TOQUE = _num("SAGE_GD_TOQUE", 0.07, 0.03, 0.3)       # segundos que se mantiene pulsado el espacio en cada salto
 V1 = 10.39                                           # bloques por segundo a velocidad 1x del juego
-DURACION_DEFECTO = 65.0                              # s: duración APROXIMADA del nivel para estimar el % hasta medirla al completarlo
-HITOS_VOZ = (25, 50, 75, 90)                         # % en los que SAGE celebra en voz alta (si supera su récord)
-FRASES_HITO = {25: "¡Veinticinco por ciento!", 50: "¡Mitad del nivel, vamos!",
-               75: "¡Setenta y cinco por ciento, qué emoción!", 90: "¡Noventa por ciento, no puedo creerlo!"}
 
 
 def _color_jugador():
@@ -88,36 +80,68 @@ class _Temporizador:
 
 
 _CAM = None   # instancia de dxcam (una por proceso)
+RUTA_CAPTURA = os.path.join(AQUI, "gd_captura.json")
+RUTA_DEBUG = os.path.join(AQUI, "gd_debug.png")
+
+
+def _motor_guardado():
+    try:
+        with open(RUTA_CAPTURA, encoding="utf-8") as f: return json.load(f).get("motor")
+    except Exception:
+        return None
+
+
+def _guardar_motor(motor):
+    try:
+        with open(RUTA_CAPTURA, "w", encoding="utf-8") as f: json.dump({"motor": motor}, f)
+    except Exception:
+        pass
 
 
 class _Pantalla:
-    """Captura rápida de una región. Devuelve arrays RGB uint8 (alto, ancho, 3). None = la pantalla no cambió (solo dxcam)."""
+    """Captura rápida de una región. Devuelve arrays RGB uint8 (alto, ancho, 3). None = la pantalla no cambió (solo dxcam).
+
+    Prueba varios motores (dxcam > mss > PIL) y recuerda el que funcionó. SAGE_GD_CAPTURA=dxcam|mss|pil fuerza uno."""
     def __init__(self):
-        global _CAM
         self.cam = self.sct = None
-        self.motor = "PIL"
-        if sys.platform == "win32":
-            try:
+        self.bgr = False        # True si el motor entrega los canales en orden BGR
+        forzado = {"dxcam": "dxcam", "mss": "mss", "pil": "PIL"}.get(os.getenv("SAGE_GD_CAPTURA", "auto").strip().lower())
+        orden = ["dxcam", "mss", "PIL"]
+        pref = forzado or _motor_guardado()
+        if pref in orden:
+            orden.remove(pref); orden.insert(0, pref)
+        self.motores = [m for m in orden if (not forzado or m == forzado) and self._abrir(m)] or ["PIL"]
+        self.motor = self.motores[0]
+
+    def _abrir(self, motor):
+        global _CAM
+        try:
+            if motor == "dxcam":
+                if sys.platform != "win32": return False
                 if _CAM is None:
                     import dxcam
                     _CAM = dxcam.create(output_color="RGB")
-                self.cam, self.motor = _CAM, "dxcam"
-            except Exception:
-                self.cam = None
-        if self.cam is None:
-            self._abrir_mss()
-
-    def _abrir_mss(self):
-        try:
-            import mss
-            self.sct, self.motor = mss.mss(), "mss"
+                self.cam = _CAM
+                return self.cam is not None
+            if motor == "mss":
+                import mss
+                self.sct = mss.mss()
+                return True
+            return True
         except Exception:
-            self.sct, self.motor = None, "PIL"
+            return False
+
+    def siguiente(self):
+        """Pasa al siguiente motor de captura; False si no quedan más."""
+        i = self.motores.index(self.motor)
+        if i + 1 >= len(self.motores): return False
+        self.motor, self.bgr = self.motores[i + 1], False
+        return True
 
     def tamano(self):
-        if self.cam is not None:
+        if self.motor == "dxcam":
             return int(self.cam.width), int(self.cam.height)
-        if self.sct is not None:
+        if self.motor == "mss":
             m = self.sct.monitors[1]
             return int(m["width"]), int(m["height"])
         from PIL import ImageGrab
@@ -125,18 +149,22 @@ class _Pantalla:
 
     def grab(self, x0, y0, x1, y1):
         reg = (int(x0), int(y0), int(x1), int(y1))
-        if self.cam is not None:
-            try:
-                return self.cam.grab(region=reg)   # dxcam espera al siguiente fotograma; None si la pantalla no cambió
-            except Exception as e:
-                print(f"[GD] dxcam falló ({e}); cambio de método de captura")
-                self.cam = None
-                self._abrir_mss()
-        if self.sct is not None:
-            m = self.sct.grab({"left": reg[0], "top": reg[1], "width": reg[2] - reg[0], "height": reg[3] - reg[1]})
-            return np.ascontiguousarray(np.asarray(m)[:, :, :3][:, :, ::-1])
-        from PIL import ImageGrab
-        return np.asarray(ImageGrab.grab(bbox=reg).convert("RGB"))
+        try:
+            if self.motor == "dxcam":
+                f = self.cam.grab(region=reg)   # dxcam espera al siguiente fotograma; None si la pantalla no cambió
+            elif self.motor == "mss":
+                m = self.sct.grab({"left": reg[0], "top": reg[1], "width": reg[2] - reg[0], "height": reg[3] - reg[1]})
+                f = np.ascontiguousarray(np.asarray(m)[:, :, :3][:, :, ::-1])
+            else:
+                from PIL import ImageGrab
+                f = np.asarray(ImageGrab.grab(bbox=reg).convert("RGB"))
+        except Exception as e:
+            print(f"[GD] la captura con {self.motor} falló: {e}")
+            if self.siguiente(): return self.grab(*reg)
+            raise
+        if f is not None and self.bgr:
+            f = np.ascontiguousarray(f[..., ::-1])
+        return f
 
 
 def _tecla_pulsada(vk):
@@ -154,38 +182,21 @@ class Memoria:
         self.nivel = nivel
         self.d0, self.mejor_t, self.mejor_n, self.intentos = 2.4, 0.0, None, 0
         self.tramo, self.saltos = {}, {}
-        self.duracion, self.mejor_pct, self.ganada = None, 0.0, 0.0
-        tiene_pct = False
         try:
             with open(RUTA_APRENDIZAJE, encoding="utf-8") as f:
                 d = json.load(f).get(nivel, {})
             self.d0 = float(d.get("d0", 2.4))
             self.mejor_t = float(d.get("mejor_t", 0.0))
             self.intentos = int(d.get("intentos", 0))
-            dur = d.get("duracion")
-            self.duracion = float(dur) if dur else None
-            tiene_pct = "mejor_pct" in d
-            self.mejor_pct = float(d.get("mejor_pct", 0.0))
             self.tramo = {int(k): float(v) for k, v in d.get("tramo", {}).items()}
             self.saltos = {int(k): float(v) for k, v in d.get("saltos", {}).items()}
             mn = d.get("mejor_n")
             self.mejor_n = int(mn) if mn is not None else None
         except Exception:
             pass
-        if not tiene_pct and self.mejor_t > 0.0:        # registro antiguo: estima el % del mejor intento para no premiar de nuevo lo ya logrado
-            self.mejor_pct = min(99.0, 100.0 * self.mejor_t / self.duracion_efectiva())
         if self.mejor_t <= 0.0 and self.mejor_n is None:
             self.mejor_n = 0                       # nivel nuevo: no hay nada que calibrar
         self.d_prueba, self.p_tramo, self.p_saltos, self.n = self.d0, dict(self.tramo), dict(self.saltos), 0
-
-    def duracion_efectiva(self):
-        """Duración del nivel (s) con la que se estima el %: SAGE_GD_DURACION > medida al completarlo > aproximada por defecto."""
-        try:
-            v = float(os.getenv("SAGE_GD_DURACION", ""))
-            if v > 0: return v
-        except ValueError:
-            pass
-        return self.duracion or DURACION_DEFECTO
 
     def nuevo_intento(self):
         self.n = 0
@@ -218,10 +229,9 @@ class Memoria:
     def saltar(self):
         self.n += 1
 
-    def terminar(self, t, pct=0.0):
+    def terminar(self, t):
         """Devuelve True si este intento mejoró el récord (y entonces adopta sus ajustes)."""
         self.intentos += 1
-        if pct > self.mejor_pct: self.mejor_pct = float(pct)
         mejora = t > self.mejor_t + 0.05
         if mejora:
             self.mejor_t, self.mejor_n = t, self.n
@@ -241,8 +251,6 @@ class Memoria:
                    "tramo": {str(k): round(v, 3) for k, v in self.tramo.items()},
                    "saltos": {str(k): round(v, 3) for k, v in self.saltos.items()}}
             if self.mejor_n is not None: reg["mejor_n"] = self.mejor_n
-            if self.duracion is not None: reg["duracion"] = round(self.duracion, 2)
-            reg["mejor_pct"] = round(self.mejor_pct, 1)
             todo[self.nivel] = reg
             with open(RUTA_APRENDIZAJE, "w", encoding="utf-8") as f: json.dump(todo, f, ensure_ascii=False, indent=1)
         except Exception as e:
@@ -255,31 +263,6 @@ class GDJugador:
         self.u = 0.0            # tamaño de un bloque en píxeles
         self.cx = 0.0           # x del cubo en pantalla
         self.base = 0.0         # y del suelo (parte baja del cubo apoyado)
-
-    @staticmethod
-    def registrar_completado(nivel, t):
-        """El nivel se completó en `t` segundos: esa es su duración real (calibra el % estimado) y el progreso queda al 100 %."""
-        mem = Memoria(nivel)
-        mem.duracion, mem.mejor_pct = float(t), 100.0
-        mem._guardar()
-
-    @staticmethod
-    def _premiar(p, mem, felicidad, log, hablar, est):
-        """El % del intento subió a `p`: recompensa de felicidad (mayor si supera el récord de progreso)."""
-        if felicidad is None: return
-        if p > mem.mejor_pct:
-            g = felicidad.recompensar(0.6, f"llegar al {p}% en Geometry Dash")
-            mem.ganada += g
-            if p % 5 == 0 or not est["rec_log"]:
-                est["rec_log"] = True
-                log(f"📈 ¡{p}%! Nuevo récord de progreso → {felicidad.resumen()} (+{g:.1f})")
-            ahora = time.perf_counter()
-            if hablar is not None and p in HITOS_VOZ and ahora - est["ult_voz"] > 6.0:
-                est["ult_voz"] = ahora
-                try: hablar(FRASES_HITO.get(p, f"¡{p} por ciento!"))
-                except Exception: pass
-        else:
-            mem.ganada += felicidad.recompensar(0.08)
 
     # ---------- detección ----------
     def _mascara(self, a):
@@ -363,7 +346,7 @@ class GDJugador:
         return p
 
     # ---------- bucle principal ----------
-    def jugar(self, nivel, log, parar, minutos=None, vista=None, felicidad=None, hablar=None):
+    def jugar(self, nivel, log, parar, minutos=None, vista=None):
         import pyautogui
         pyautogui.PAUSE = 0
         minutos = minutos if minutos is not None else float(os.getenv("SAGE_GD_MINUTOS", "10"))
@@ -371,37 +354,62 @@ class GDJugador:
         mem = Memoria(nivel)
         with _Temporizador():
             try:
-                return self._partida(pyautogui, pant, mem, log, parar, minutos, vista, felicidad, hablar)
+                return self._partida(pyautogui, pant, mem, log, parar, minutos, vista)
             finally:
                 try: pyautogui.keyUp("space", _pause=False)
                 except Exception: pass
 
     @staticmethod
     def _res(motivo, mem, tiempos, fps=0.0):
-        return {"motivo": motivo, "intentos": len(tiempos), "mejor": mem.mejor_t, "tiempos": tiempos, "fps": fps,
-                "pct": mem.mejor_pct, "ganada": mem.ganada, "duracion": mem.duracion_efectiva()}
+        return {"motivo": motivo, "intentos": len(tiempos), "mejor": mem.mejor_t, "tiempos": tiempos, "fps": fps}
 
-    def _partida(self, pyautogui, pant, mem, log, parar, minutos, vista, felicidad=None, hablar=None):
+    def _partida(self, pyautogui, pant, mem, log, parar, minutos, vista):
         sw, sh = pant.tamano()
         log(f"👁 Visión en vivo ({pant.motor}, objetivo {FPS} FPS): buscando el cubo para calibrar...")
-        if pant.motor != "dxcam":
-            log("ℹ Para llegar de verdad a 60 FPS instala dxcam: pip install dxcam" if pant.motor == "mss"
-                else "ℹ Captura lenta (PIL). Instala dxcam para 60 FPS: pip install dxcam")
+        if "dxcam" not in pant.motores:
+            log("ℹ Sin dxcam la captura va más lenta que 60 FPS. Instálalo con: python -m pip install dxcam")
 
-        t0, ok = time.perf_counter(), 0
-        while time.perf_counter() - t0 < 25 and ok < 3:
+        t0 = t_motor = time.perf_counter()
+        ok, diag = 0, False
+        while time.perf_counter() - t0 < 35 and ok < 3:
             if parar(): return self._res("detenido por Niko", mem, [])
             img = pant.grab(0, 0, sw, sh)
             if img is not None:
-                ok = ok + 1 if self.calibrar(img) else 0
+                if self.calibrar(img):
+                    ok += 1
+                else:
+                    ok = 0
+                    if self.calibrar(img[..., ::-1]):        # el motor entrega BGR en vez de RGB
+                        pant.bgr = not pant.bgr
+                        log(f"🎨 {pant.motor} entrega los colores invertidos: lo corrijo.")
+                        ok = 1
+            if ok == 0 and time.perf_counter() - t_motor > 5.0:
+                if img is not None:
+                    media = float(img.mean())
+                    desc = f"imagen {img.shape[1]}x{img.shape[0]}, brillo medio {media:.0f}/255" + (
+                        " → pantalla NEGRA (¿juego a pantalla completa exclusiva u otro monitor?)" if media < 8 else "")
+                    if not diag:
+                        diag = True
+                        try:
+                            from PIL import Image
+                            Image.fromarray(np.ascontiguousarray(img)).save(RUTA_DEBUG)
+                            desc += " · guardé gd_debug.png con lo que ve SAGE"
+                        except Exception:
+                            pass
+                else:
+                    desc = "no entrega fotogramas"
+                log(f"⚠ Con {pant.motor} no veo el cubo ({desc}).")
+                if pant.siguiente():
+                    log(f"🔄 Pruebo otro método de captura: {pant.motor}")
+                    sw, sh = pant.tamano()
+                    t_motor = time.perf_counter()
+                else:
+                    t_motor = float("inf")                    # no quedan métodos: sigo esperando sin repetir el aviso
             time.sleep(0.1)
         if ok < 3:
-            return self._res("no encontré el cubo (¿no es verde lima? pon SAGE_GD_COLOR=r,g,b en .env)", mem, [])
-        log(f"🎯 Calibrado: bloque ≈ {self.u:.0f}px. Aprendido de antes: {mem.intentos} intentos, récord {mem.mejor_t:.1f}s. F8 para parar, F9 cubo/nave.")
-
-        if felicidad is not None:
-            dur_txt = f"{mem.duracion_efectiva():.0f}s " + ("medidos" if mem.duracion else "aproximados; se ajustan solos al completar el nivel o con SAGE_GD_DURACION")
-            log(f"📊 Progreso estimado por tiempo (nivel ≈ {dur_txt}). Cada % que avance me hace más feliz 💖 ({felicidad.resumen()}).")
+            return self._res("no encontré el cubo (mira gd_debug.png: ¿sale el juego? ¿no es verde lima? pon SAGE_GD_COLOR=r,g,b en .env)", mem, [])
+        _guardar_motor(pant.motor)
+        log(f"🎯 Calibrado con {pant.motor}: bloque ≈ {self.u:.0f}px. Aprendido de antes: {mem.intentos} intentos, récord {mem.mejor_t:.1f}s. F8 para parar, F9 cubo/nave.")
 
         bx0, bx1 = max(0, int(self.cx - 1.5 * self.u)), min(sw, int(self.cx + 9 * self.u))
         by0, by1 = max(0, int(self.base - 8 * self.u)), min(sh, int(self.base + 0.4 * self.u))
@@ -416,9 +424,6 @@ class GDJugador:
         dprev = tprev = None
         v_est = V1
         r = {"presente": False, "dist": None, "huecos": None}
-        dur_nivel = mem.duracion_efectiva()
-        pct_int = 0
-        est = {"rec_log": False, "ult_voz": 0.0}
 
         while True:
             ahora = time.perf_counter()
@@ -452,20 +457,13 @@ class GDJugador:
                     estado = (f" · obstáculo a {r['dist']:.1f} bloques" if r.get("dist") is not None
                               else (" · sin cubo" if not r["presente"] else " · vía libre"))
                     vista(self._preview(banda, bx0, by0, r),
-                          f"{fps:.0f} FPS · {modo} · intento {mem.intentos + 1} · récord {mem.mejor_t:.1f}s" + estado
-                          + f" · {pct_int}% (récord {mem.mejor_pct:.0f}%)" + (f" · {felicidad.resumen()}" if felicidad else ""))
+                          f"{fps:.0f} FPS · {modo} · intento {mem.intentos + 1} · récord {mem.mejor_t:.1f}s" + estado)
 
                 if r["presente"]:
                     if inicio is None:
                         inicio = ahora; mem.nuevo_intento(); v_est = V1; dprev = tprev = None
-                        pct_int = 0; est["rec_log"] = False
                     ultimo_visto = ahora
                     t = ahora - inicio
-                    pasos = int(min(99.0, 100.0 * t / dur_nivel))     # % estimado del nivel por tiempo
-                    if pasos > pct_int:
-                        for p in range(pct_int + 1, pasos + 1):
-                            self._premiar(p, mem, felicidad, log, hablar, est)
-                        pct_int = pasos
                     if modo == "cubo":
                         dist = r["dist"]
                         if dist is not None and dprev is not None and tprev is not None:   # velocidad real del scroll (portales de velocidad)
@@ -498,8 +496,8 @@ class GDJugador:
                 if dur >= 0.6:
                     saltos = mem.n
                     tiempos.append(dur)
-                    mejora = mem.terminar(dur, pct_int)
-                    log(f"💥 Intento {mem.intentos}: {dur:.1f}s ({pct_int}%), {saltos} saltos" + (" ⭐ ¡nuevo récord!" if mejora else f" (récord {mem.mejor_t:.1f}s)"))
+                    mejora = mem.terminar(dur)
+                    log(f"💥 Intento {mem.intentos}: {dur:.1f}s, {saltos} saltos" + (" ⭐ ¡nuevo récord!" if mejora else f" (récord {mem.mejor_t:.1f}s)"))
                 inicio = None
             elif inicio is None and ultimo_visto is not None and ahora - ultimo_visto > 4.0:
                 motivo = "el cubo no volvió a aparecer (nivel completado, pausa o menú)"; break

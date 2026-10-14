@@ -15,9 +15,9 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 
 def main():
     load_dotenv(os.path.join(AQUI, ".env"))
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEYS")
     if not api_key:
-        print("Falta GEMINI_API_KEY en .env")
+        print("Falta GEMINI_API_KEYS en .env")
         return 1
 
     filtro = sys.argv[1].lower() if len(sys.argv) > 1 else ""

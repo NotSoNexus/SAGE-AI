@@ -1,14 +1,32 @@
-# --- Dependencias directas de SAGE (sin fijar versión) ---
-PySide6
-faster-whisper
-sounddevice
-edge-tts
-pygame
-scipy
-pillow
-mss
-numpy
-pyaudiowpatch; sys_platform == "win32"
+# --- Dependencias directas de SAGE (sin fijar versión; cada una con el módulo que la usa) ---
+PySide6                                  # interfaz (app.py, comentarista.py)
+faster-whisper                           # oído: voz a texto (oido.py)
+sounddevice                              # micrófono (oido.py)
+pyaudiowpatch; sys_platform == "win32"   # captura del audio del sistema (oido.py)
+scipy                                    # remuestreo de audio / etiquetado de imágenes (oido.py, gd_jugador.py)
+edge-tts                                 # voz de SAGE (boca.py)
+pygame-ce                                # reproductor de voz y campanita (boca.py); reemplaza a pygame (mismo `import pygame`, sí trae instalador para Python nuevo)
+google-genai                             # Gemini: cerebro y visión (cerebro.py, modelos.py, spotify_sage.py)
+python-dotenv                            # lee el .env (cerebro.py, modelos.py, spotify_sage.py)
+chromadb                                 # memoria vectorial y lecciones (cerebro.py)
+numpy                                    # análisis de imagen y audio (ojos.py, oido.py, gd_jugador.py)
+pillow                                   # capturas e imágenes (ojos.py, app.py)
+mss                                      # captura de pantalla rápida (ojos.py, gd_jugador.py)
+dxcam; sys_platform == "win32"           # captura DirectX a 60+ fps para Geometry Dash (gd_jugador.py); opcional, usa mss si falta
+pyautogui                                # mouse y teclado (app.py)
+pywinauto                                # UI Automation: pestañas y Discord en segundo plano (app.py, discord_voz.py)
+spotipy                                  # Spotify Web API (spotify_sage.py; ya incluida, requiere cuenta Premium)
+
+# --- Dependencias que las anteriores necesitan y conviene declarar de forma explícita ---
+pywin32; sys_platform == "win32"         # COM/Win32 que usa pywinauto (UI Automation)
+comtypes; sys_platform == "win32"        # pywinauto (UIAWrapper) y dxcam
+ctranslate2                              # motor de faster-whisper (oido.py)
+av                                       # decodificación de audio de faster-whisper
+requests                                 # spotipy / peticiones HTTP
+pymsgbox                                 # pyautogui
+pytweening                               # pyautogui
+pyscreeze                                # pyautogui (capturas y búsqueda de imágenes)
+pygetwindow                              # pyautogui
 
 # --- Versiones fijadas (pip freeze) ---
 aiohappyeyeballs==2.7.1

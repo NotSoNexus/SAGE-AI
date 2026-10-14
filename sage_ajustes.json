@@ -1,0 +1,26 @@
+{
+ "colores": {
+  "idle": "#39ff14",
+  "escuchando": "#00f3ff",
+  "pensando": "#ff003c",
+  "respondiendo": "#ffaa00",
+  "error": "#8b0000",
+  "oro": "#ffcc00"
+ },
+ "autor": {
+  "niko": "#00f3ff",
+  "sage": "#ff003c",
+  "sistema": "#39ff14"
+ },
+ "anim_vel": 1.0,
+ "anim_amp": 1.0,
+ "fps": 30,
+ "voz": "es-PE-CamilaNeural",
+ "voz_vel": 25,
+ "mouse_dur": 0.09,
+ "mouse_vel": 9000.0,
+ "verificar": false,
+ "fel_base": 50.0,
+ "fel_vida": 6.0,
+ "fijar_hud": false
+}
